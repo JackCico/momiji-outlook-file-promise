@@ -44,7 +44,7 @@ export RUSTFLAGS="-C target-cpu=core2 -C link-arg=-ld_classic"
 export LDFLAGS="-headerpad_max_install_names -ld_classic"
 
 # ========== OPTIMIZATIONS ==========   
-# ac_add_options --disable-crashreporter    # Restore crashreporter since 140.16.0esr-mj
+ac_add_options --disable-crashreporter
 ac_add_options --disable-tests
 ac_add_options --disable-dmd
 ac_add_options --disable-geckodriver
