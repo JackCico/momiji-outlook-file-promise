@@ -9,7 +9,7 @@ jobs:
   build:
     name: build official Momiji
     runs-on: macos-15     # arm64 runner
-    if: ${{ !contains(github.event.head_commit.message, 'DONTBUILD') && !contains(github.event.head_commit.message, 'IGNORE10071008') && contains(github.event.head_commit.message, 'BUILDMOMIJI') }}
+    if: ${{ !contains(github.event.head_commit.message, 'DONTBUILD') }}
     steps:
       - name: Checkout
         id: checkout
