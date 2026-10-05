@@ -50,7 +50,7 @@ ac_add_options --disable-dmd
 ac_add_options --disable-geckodriver
 ac_add_options --disable-profiling
 ac_add_options --disable-updater
-ac_add_options --disable-sandbox # On 10.7, sandbox causes some video-streaming services is broken.
+# ac_add_options --disable-sandbox # On 10.7, sandbox causes some video-streaming services is broken.
 
 # ===== CUSTOMIZATION ==== #
 export MOZ_REQUIRE_SIGNING=     # Disable extension signing check
