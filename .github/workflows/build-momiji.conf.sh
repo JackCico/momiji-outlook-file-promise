@@ -50,7 +50,7 @@ ac_add_options --disable-dmd
 ac_add_options --disable-geckodriver
 ac_add_options --disable-profiling
 ac_add_options --disable-updater
-ac_add_options --disable-sandbox # Turn this off for the sake of OpenWV/Windevine CDM
+# ac_add_options --disable-sandbox # Comment this to enable OpenWV/Windevine CDM
 
 # ===== CUSTOMIZATION ==== #
 export MOZ_REQUIRE_SIGNING=     # Disable extension signing check
