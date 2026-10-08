@@ -8341,6 +8341,14 @@ static NSMutableSet* gSwizzledFrameViewClasses = nil;
   return self;
 }
 
+static CGFloat GetMenuCornerRadius() {
+  return nsCocoaFeatures::OnTahoeOrLater() ? 12.0f : 6.0f;
+}
+
+static CGFloat GetTooltipCornerRadius() {
+  return nsCocoaFeatures::OnGoldenGateOrLater() ? 5.0f : 0.0f;
+}
+
 // Returns an autoreleased NSImage that rounds the corners at aRadius.
 static NSImage* GetCornerMaskImage(CGFloat aRadius) {
   const NSSize maskSize = {aRadius * 3.0f, aRadius * 3.0f};
