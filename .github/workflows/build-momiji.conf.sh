@@ -44,25 +44,25 @@ export RUSTFLAGS="-C target-cpu=core2 -C link-arg=-ld_classic"
 export LDFLAGS="-headerpad_max_install_names -ld_classic"
 
 # ========== OPTIMIZATIONS ==========   
-# ac_add_options --disable-crashreporter    # Comment this if you need crashreporter to debug
+ac_add_options --disable-crashreporter    # Comment this if you need crashreporter to debug
 ac_add_options --disable-tests
 ac_add_options --disable-dmd
 ac_add_options --disable-geckodriver
 ac_add_options --disable-profiling
 ac_add_options --disable-updater
-# ac_add_options --disable-sandbox # Comment this to enable OpenWV/Windevine CDM
+ac_add_options --disable-sandbox    # Sandbox cause video playing on OS X 10.7 to malfunction. OpenWV still functions without this.
 
 # ===== CUSTOMIZATION ==== #
 export MOZ_REQUIRE_SIGNING=     # Disable extension signing check
 
 # ========= Production-specific optimizations (reference from Waterfox) ===========     
-# ac_add_options --disable-debug
-# ac_add_options --enable-optimize="-Os -w"
-# export RUSTC_OPT_LEVEL="s"
+ac_add_options --disable-debug
+ac_add_options --enable-optimize="-Os -w"
+export RUSTC_OPT_LEVEL="s"
 
 
 # ========= Testing-specific optimizations (reference from Waterfox) ===========
-ac_add_options --enable-debug-symbols
-ac_add_options --disable-install-strip
-ac_add_options --enable-optimize="-Og -w"
-export RUSTC_OPT_LEVEL="1"
+# ac_add_options --enable-debug-symbols
+# ac_add_options --disable-install-strip
+# ac_add_options --enable-optimize="-Og -w"
+# export RUSTC_OPT_LEVEL="1"
