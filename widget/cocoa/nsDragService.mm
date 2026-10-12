@@ -47,6 +47,7 @@ already_AddRefed<nsIDragSession> nsDragService::CreateDragSession() {
   return sess.forget();
 }
 
+// --- Momiji: merging these new upstream codes to see if it works (from v158.0b5) ---
 /* static */
 void nsDragService::EndStaleDragSession() {
   nsCOMPtr<nsIDragService> service =
@@ -85,6 +86,19 @@ void nsDragSession::EndAsStale() {
   }
   EndDragSession(true, 0);
 }
+// --- Momiji: merging these new upstream codes to see if it works (from v158.0b5) ---
+
+#if !defined(MAC_OS_X_VERSION_10_8) || MAC_OS_X_VERSION_MAX_ALLOWED < MAC_OS_X_VERSION_10_8
+/* this imagewithSize, unlike the one in nsCocoaWindow.mm,
+ * was added after 10.7 support was dropped. so, i am adding
+ * it here because i saw an exception and it has to be here*/
+@interface NSImage (ImageCreationWithDrawingHandler)
++ (NSImage*)imageWithSize:(NSSize)size
+                  flipped:(BOOL)drawingHandlerShouldBeCalledWithFlippedContext
+           drawingHandler:(BOOL (^)(NSRect dstRect))drawingHandler;
+@end
+
+#endif
 
 NSImage* nsDragSession::ConstructDragImage(nsINode* aDOMNode,
                                            const Maybe<CSSIntRegion>& aRegion,
@@ -103,6 +117,7 @@ NSImage* nsDragSession::ConstructDragImage(nsINode* aDOMNode,
         nsCocoaUtils::DevPixelsToCocoaPoints(dragRect.width, scaleFactor);
     size.height =
         nsCocoaUtils::DevPixelsToCocoaPoints(dragRect.height, scaleFactor);
+    if(@available(macOS 10.8, *)) {
     image = [NSImage imageWithSize:size
                            flipped:YES
                     drawingHandler:^BOOL(NSRect dstRect) {
@@ -113,6 +128,20 @@ NSImage* nsDragSession::ConstructDragImage(nsINode* aDOMNode,
                       [path stroke];
                       return YES;
                     }];
+    } else {
+      image = [[NSImage alloc] initWithSize:size];
+      [image lockFocus];
+      [[NSColor grayColor] set];
+      NSBezierPath* path = [NSBezierPath bezierPath];
+      [path setLineWidth:2.0];
+      [path moveToPoint:NSMakePoint(0, 0)];
+      [path lineToPoint:NSMakePoint(0, size.height)];
+      [path lineToPoint:NSMakePoint(size.width, size.height)];
+      [path lineToPoint:NSMakePoint(size.width, 0)];
+      [path lineToPoint:NSMakePoint(0, 0)];
+      [path stroke];
+      [image unlockFocus];
+    }
   }
 
   LayoutDeviceIntPoint pt(dragRect.x, dragRect.YMost());
