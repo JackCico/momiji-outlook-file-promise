@@ -841,7 +841,7 @@
   mirror: always
 
 - name: apz.pinch_lock.buffer_max_age
-  type: int32_t
+  type: uint32_t
   value: 80   # milliseconds
   mirror: once
 
@@ -895,7 +895,7 @@
   mirror: always
 
 - name: apz.touch_scroll.buffer_max_age
-  type: int32_t
+  type: uint32_t
   value: 200  # milliseconds
   mirror: once
 
@@ -3267,6 +3267,13 @@
 # This pref controls whether <input type=search> clears its value on Esc
 # keydown.
 - name: dom.forms.search.esc
+  type: bool
+  value: true
+  mirror: always
+
+# Whether to do the navigation for form submission asynchronously
+# (which is what the spec wants)
+- name: dom.forms.submit_async_navigation
   type: bool
   value: true
   mirror: always
@@ -16897,6 +16904,13 @@
 - name: network.socket.prioritize_runnables
   type: RelaxedAtomicBool
   value: true
+  mirror: always
+
+# Specifies for how many miliseconds to keep processing socket thread events
+# after shutdown was triggered.
+- name: network.socket.shutdown_process_events_ms
+  type: RelaxedAtomicUint32
+  value: 3000
   mirror: always
 
 # Maximum duration (seconds) that transmitted data may remain unacknowledged

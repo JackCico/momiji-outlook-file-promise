@@ -73,10 +73,12 @@
 #  include <climits>
 #endif  // XP_WIN
 
-// Amount of the progress bar to use in each of the 3 update stages,
-// should total 100.0.
+// Amount of the progress bar to use in each of the 4 update phases,
+// should total 100.0. Estimates are for non-staged updates, because
+// only they show the progress UI.
 #define PROGRESS_PREPARE_SIZE 20.0f
-#define PROGRESS_EXECUTE_SIZE 75.0f
+#define PROGRESS_DRAFT_SIZE 65.0f
+#define PROGRESS_EXECUTE_SIZE 10.0f
 #define PROGRESS_FINISH_SIZE 5.0f
 
 // Maximum amount of time in ms to wait for the parent process to close. The 30
@@ -632,6 +634,27 @@ static void ensure_write_permissions(const NS_tchar* path) {
 }
 
 static int ensure_remove(const NS_tchar* path) {
+#if defined(TEST_UPDATER) && defined(XP_WIN)
+  // Matching is on the leaf name only, and exact: a test that makes the removal
+  // of a file fail must not also make the removal of, say, its backup or its
+  // draft fail.
+  const wchar_t* failName = _wgetenv(L"MOZ_TEST_ENSURE_REMOVE_FAIL");
+  if (failName && *failName) {
+    const wchar_t* leaf = path;
+    for (const wchar_t* c = path; *c; ++c) {
+      if (*c == L'\\' || *c == L'/') {
+        leaf = c + 1;
+      }
+    }
+    if (!wcscmp(leaf, failName)) {
+      LOG(
+          ("ensure_remove: TEST fault injection, pretending removal "
+           "failed: " LOG_S,
+           path));
+      return -1;
+    }
+  }
+#endif
   ensure_write_permissions(path);
   int rv = NS_tremove(path);
   if (rv) {
@@ -871,6 +894,14 @@ static int ensure_copy(const NS_tchar* path, const NS_tchar* dest) {
 #endif
 }
 
+// Returns true if the path is that of a draft file, that is, a file that the
+// Draft phase of a non-staged update writes new contents to.
+static bool is_draft_path(const NS_tchar* path) {
+  size_t pathLen = NS_tstrlen(path);
+  size_t extLen = NS_tstrlen(DRAFT_EXT);
+  return pathLen > extLen && !NS_tstricmp(path + pathLen - extLen, DRAFT_EXT);
+}
+
 template <unsigned N>
 struct copy_recursive_skiplist {
   NS_tchar paths[N][MAXPATHLEN];
@@ -891,6 +922,9 @@ struct copy_recursive_skiplist {
 
 // Copy all of the files and subdirectories under path to a new directory named
 // dest. The path names in the skiplist will be skipped and will not be copied.
+// Draft files are always skipped: a draft that a crashed updater instance left
+// behind is not part of the installation, so it must not be copied into an
+// updated one, where nothing would ever get rid of it.
 template <unsigned N>
 static int ensure_copy_recursive(const NS_tchar* path, const NS_tchar* dest,
                                  copy_recursive_skiplist<N>& skiplist) {
@@ -938,7 +972,7 @@ static int ensure_copy_recursive(const NS_tchar* path, const NS_tchar* dest,
       NS_tchar childPath[MAXPATHLEN];
       NS_tsnprintf(childPath, sizeof(childPath) / sizeof(childPath[0]),
                    NS_T("%s/%s"), path, entry->d_name);
-      if (skiplist.find(childPath)) {
+      if (skiplist.find(childPath) || is_draft_path(entry->d_name)) {
         continue;
       }
       NS_tchar childPathDest[MAXPATHLEN];
@@ -954,6 +988,43 @@ static int ensure_copy_recursive(const NS_tchar* path, const NS_tchar* dest,
   NS_tclosedir(dir);
   return rv;
 }
+
+#ifdef XP_WIN
+// Moves a file that could not be removed into the deletion directory, and
+// schedules it for removal on the next OS reboot.
+static int remove_on_reboot(const NS_tchar* path) {
+  if (sStagedUpdate || sReplaceRequest) {
+    return WRITE_ERROR_DELETE_FILE;
+  }
+
+  NS_tchar deletePath[MAXPATHLEN + 1];
+  if (!GetUUIDTempFilePath(gDeleteDirPath, L"moz", deletePath)) {
+    LOG(("remove_on_reboot: failed to generate a temporary file path"));
+    return WRITE_ERROR_DELETE_FILE;
+  }
+  if (NS_trename(path, deletePath) != 0) {
+    LOG(("remove_on_reboot: failed to move file out of the way: " LOG_S
+         ", err: %d",
+         path, errno));
+    return WRITE_ERROR_DELETE_FILE;
+  }
+
+  // The MoveFileEx call to remove the file on OS reboot will fail if the
+  // process doesn't have write access to the HKEY_LOCAL_MACHINE registry key
+  // but this is ok since the installer / uninstaller will delete the
+  // directory containing the file along with its contents after an update is
+  // applied, on reinstall, and on uninstall.
+  if (MoveFileEx(deletePath, nullptr, MOVEFILE_DELAY_UNTIL_REBOOT)) {
+    LOG(("remove_on_reboot: file will be removed on OS reboot: " LOG_S, path));
+  } else {
+    LOG(
+        ("remove_on_reboot: failed to schedule OS reboot removal of "
+         "file: " LOG_S,
+         path));
+  }
+  return OK;
+}
+#endif
 
 // Renames the specified file to the new file specified. If the destination file
 // exists it is removed.
@@ -983,11 +1054,17 @@ static int rename_file(const NS_tchar* spath, const NS_tchar* dpath,
   }
 
   if (!NS_taccess(dpath, F_OK)) {
-    if (ensure_remove(dpath)) {
+    rv = ensure_remove(dpath);
+    if (rv) {
       LOG(
           ("rename_file: destination file exists and could not be "
            "removed: " LOG_S,
            dpath));
+#ifdef XP_WIN
+      rv = remove_on_reboot(dpath);
+    }
+    if (rv) {
+#endif
       return WRITE_ERROR_DELETE_FILE;
     }
   }
@@ -1017,7 +1094,12 @@ static int remove_recursive_on_reboot(const NS_tchar* path,
 
   if (!S_ISDIR(sInfo.st_mode)) {
     NS_tchar tmpDeleteFile[MAXPATHLEN + 1];
-    GetUUIDTempFilePath(deleteDir, L"rep", tmpDeleteFile);
+    if (!GetUUIDTempFilePath(deleteDir, L"rep", tmpDeleteFile)) {
+      LOG(
+          ("remove_recursive_on_reboot: failed to generate a temporary file "
+           "path"));
+      return WRITE_ERROR_DELETE_FILE;
+    }
     if (NS_tremove(tmpDeleteFile) && errno != ENOENT) {
       LOG(("remove_recursive_on_reboot: failed to remove temporary file: " LOG_S
            ", err: %d",
@@ -1125,40 +1207,67 @@ static int backup_discard(const NS_tchar* path, const NS_tchar* relPath) {
   }
 
   int rv = ensure_remove(backup);
-#if defined(XP_WIN)
-  if (rv && !sStagedUpdate && !sReplaceRequest) {
-    LOG(("backup_discard: unable to remove: " LOG_S, relBackup));
-    NS_tchar path[MAXPATHLEN + 1];
-    GetUUIDTempFilePath(gDeleteDirPath, L"moz", path);
-    if (rename_file(backup, path)) {
-      LOG(("backup_discard: failed to rename file:" LOG_S ", dst:" LOG_S,
-           relBackup, relPath));
-      return WRITE_ERROR_DELETE_BACKUP;
-    }
-    // The MoveFileEx call to remove the file on OS reboot will fail if the
-    // process doesn't have write access to the HKEY_LOCAL_MACHINE registry key
-    // but this is ok since the installer / uninstaller will delete the
-    // directory containing the file along with its contents after an update is
-    // applied, on reinstall, and on uninstall.
-    if (MoveFileEx(path, nullptr, MOVEFILE_DELAY_UNTIL_REBOOT)) {
-      LOG(
-          ("backup_discard: file renamed and will be removed on OS "
-           "reboot: " LOG_S,
-           relPath));
-    } else {
-      LOG(
-          ("backup_discard: failed to schedule OS reboot removal of "
-           "file: " LOG_S,
-           relPath));
-    }
-  }
-#else
   if (rv) {
+    LOG(("backup_discard: unable to remove: " LOG_S, relBackup));
+#ifdef XP_WIN
+    rv = remove_on_reboot(backup);
+  }
+  if (rv) {
+#endif
     return WRITE_ERROR_DELETE_BACKUP;
   }
-#endif
 
   return OK;
+}
+
+[[nodiscard]] static bool draft_path(NS_tchar (&draft)[MAXPATHLEN],
+                                     const NS_tchar* path) {
+  return NS_tvsnprintf(draft, MAXPATHLEN, NS_T("%s") DRAFT_EXT, path);
+}
+
+// Discard the file that holds the draft contents of the specified file. This is
+// also used to get rid of files that a previous updater instance left behind
+// when it crashed, so it only ever discards drafts for paths that the update
+// being applied produces new contents for.
+static int draft_discard(const NS_tchar* path, const NS_tchar* relPath) {
+  NS_tchar draft[MAXPATHLEN];
+  NS_tchar relDraft[MAXPATHLEN];
+  if (!draft_path(draft, path) || !draft_path(relDraft, relPath)) {
+    LOG(("draft_discard: draft path too long for: " LOG_S, relPath));
+    return USAGE_ERROR;
+  }
+
+  // Nothing to discard.
+  if (NS_taccess(draft, F_OK)) {
+    return OK;
+  }
+
+  LOG(("draft_discard: discarding draft file: " LOG_S, relDraft));
+
+  int rv = ensure_remove(draft);
+  if (rv) {
+    LOG(("draft_discard: unable to remove: " LOG_S, relDraft));
+#ifdef XP_WIN
+    rv = remove_on_reboot(draft);
+  }
+  if (rv) {
+#endif
+    return WRITE_ERROR_DELETE_FILE;
+  }
+
+  return OK;
+}
+
+// Move the file that holds the draft contents of the specified file into
+// place. The specified file must have been moved out of the way already.
+static int draft_commit(const NS_tchar* path) {
+  NS_tchar draft[MAXPATHLEN];
+  if (!draft_path(draft, path)) {
+    LOG(("draft_commit: draft path too long"));
+    return USAGE_ERROR;
+  }
+
+  return rename_file(draft, path);
 }
 
 // Helper function for post-processing a temporary backup.
@@ -1169,6 +1278,36 @@ static void backup_finish(const NS_tchar* path, const NS_tchar* relPath,
   } else {
     backup_restore(path, relPath);
   }
+}
+
+static int extract_file(const NS_tchar* itemPath, const NS_tchar* dstPath) {
+#ifdef XP_WIN
+  char mbItemPath[MAXPATHLEN];
+  if (!WideCharToMultiByte(CP_UTF8, 0, itemPath, -1, mbItemPath, MAXPATHLEN,
+                           nullptr, nullptr)) {
+    LOG(("error converting wchar to utf8: %lu", GetLastError()));
+    return STRING_CONVERSION_ERROR;
+  }
+
+  return gArchiveReader.ExtractFile(mbItemPath, dstPath);
+#else
+  return gArchiveReader.ExtractFile(itemPath, dstPath);
+#endif
+}
+
+static int extract_file_to_stream(const NS_tchar* itemPath, FILE* dstStream) {
+#ifdef XP_WIN
+  char mbItemPath[MAXPATHLEN];
+  if (!WideCharToMultiByte(CP_UTF8, 0, itemPath, -1, mbItemPath, MAXPATHLEN,
+                           nullptr, nullptr)) {
+    LOG(("error converting wchar to utf8: %lu", GetLastError()));
+    return STRING_CONVERSION_ERROR;
+  }
+
+  return gArchiveReader.ExtractFileToStream(mbItemPath, dstStream);
+#else
+  return gArchiveReader.ExtractFileToStream(itemPath, dstStream);
+#endif
 }
 
 //-----------------------------------------------------------------------------
@@ -1182,9 +1321,14 @@ class Action {
 
   virtual int Parse(NS_tchar* line) = 0;
 
-  // Do any preprocessing to ensure that the action can be performed.  Execute
+  // Do any preprocessing to ensure that the action can be performed.  Draft
   // will be called if this Action and all others return OK from this method.
   virtual int Prepare() = 0;
+
+  // In non-staged updates, write the new contents of the file that this action
+  // produces to a draft file next to the target file.  Execute will be called
+  // if this Action and all others return OK from this method.
+  virtual int Draft() = 0;
 
   // Perform the operation.  Return OK to indicate success.  After all actions
   // have been executed, Finish will be called.  A requirement of Execute is
@@ -1209,6 +1353,7 @@ class RemoveFile : public Action {
 
   int Parse(NS_tchar* line) override;
   int Prepare() override;
+  int Draft() override { return OK; }
   int Execute() override;
   void Finish(int status) override;
 
@@ -1299,7 +1444,7 @@ int RemoveFile::Execute() {
     // Staged updates don't need backup files so just remove it.
     rv = ensure_remove(mFile.get());
     if (rv) {
-      return rv;
+      return WRITE_ERROR_DELETE_FILE;
     }
   } else {
     // Rename the old file. It will be removed in Finish.
@@ -1332,6 +1477,7 @@ class RemoveDir : public Action {
 
   int Parse(NS_tchar* line) override;
   int Prepare() override;  // check that the source dir exists
+  int Draft() override { return OK; }
   int Execute() override;
   void Finish(int status) override;
 
@@ -1441,6 +1587,7 @@ class AddFile : public Action {
 
   int Parse(NS_tchar* line) override;
   int Prepare() override;
+  int Draft() override;
   int Execute() override;
   void Finish(int status) override;
 
@@ -1475,6 +1622,36 @@ int AddFile::Prepare() {
   return OK;
 }
 
+int AddFile::Draft() {
+  // Logged before the staged update check on purpose: staged and non-staged
+  // updater tests compare against the same expected update logs.
+  LOG(("DRAFT ADD " LOG_S, mRelPath.get()));
+
+  if (sStagedUpdate) {
+    return OK;
+  }
+
+  NS_tchar draft[MAXPATHLEN];
+  if (!draft_path(draft, mFile.get())) {
+    LOG(("draft path too long for: " LOG_S, mRelPath.get()));
+    return USAGE_ERROR;
+  }
+
+  int rv = ensure_parent_dir(mFile.get());
+  if (rv) {
+    return rv;
+  }
+
+  // Get rid of a draft that a previous updater instance left behind, so that
+  // the new one is created with the mode that the archive asks for.
+  rv = draft_discard(mFile.get(), mRelPath.get());
+  if (rv) {
+    return rv;
+  }
+
+  return extract_file(mRelPath.get(), draft);
+}
+
 int AddFile::Execute() {
   LOG(("EXECUTE ADD " LOG_S, mRelPath.get()));
 
@@ -1485,12 +1662,14 @@ int AddFile::Execute() {
   if (rv == 0) {
     if (sStagedUpdate) {
       // Staged updates don't need backup files so just remove it.
-      rv = ensure_remove(mFile.get());
+      if (ensure_remove(mFile.get())) {
+        return WRITE_ERROR_DELETE_FILE;
+      }
     } else {
       rv = backup_create(mFile.get());
-    }
-    if (rv) {
-      return rv;
+      if (rv) {
+        return rv;
+      }
     }
   } else {
     rv = ensure_parent_dir(mFile.get());
@@ -1499,18 +1678,16 @@ int AddFile::Execute() {
     }
   }
 
-#ifdef XP_WIN
-  char sourcefile[MAXPATHLEN];
-  if (!WideCharToMultiByte(CP_UTF8, 0, mRelPath.get(), -1, sourcefile,
-                           MAXPATHLEN, nullptr, nullptr)) {
-    LOG(("error converting wchar to utf8: %lu", GetLastError()));
-    return STRING_CONVERSION_ERROR;
+  if (!sStagedUpdate) {
+    // The new contents have already been written during the Draft phase.
+    rv = draft_commit(mFile.get());
+    if (!rv) {
+      mAdded = true;
+    }
+    return rv;
   }
 
-  rv = gArchiveReader.ExtractFile(sourcefile, mFile.get());
-#else
-  rv = gArchiveReader.ExtractFile(mRelPath.get(), mFile.get());
-#endif
+  rv = extract_file(mRelPath.get(), mFile.get());
   if (!rv) {
     mAdded = true;
   }
@@ -1521,6 +1698,10 @@ void AddFile::Finish(int status) {
   LOG(("FINISH ADD " LOG_S, mRelPath.get()));
   // Staged updates don't create backup files.
   if (!sStagedUpdate) {
+    // Get rid of the new contents if they were never moved into place, which
+    // happens when the update failed before or during the Execute phase.
+    draft_discard(mFile.get(), mRelPath.get());
+
     // When there is an update failure and a file has been added it is removed
     // here since there might not be a backup to replace it.
     if (status && mAdded) {
@@ -1528,6 +1709,9 @@ void AddFile::Finish(int status) {
         LOG(("non-fatal error after update failure removing added file: " LOG_S
              ", err: %d",
              mFile.get(), errno));
+#ifdef XP_WIN
+        (void)remove_on_reboot(mFile.get());
+#endif
       }
     }
     backup_finish(mFile.get(), mRelPath.get(), status);
@@ -1746,11 +1930,20 @@ class PatchFile : public Action {
 
   int Parse(NS_tchar* line) override;
   int Prepare() override;  // should check for patch file and for checksum here
+  int Draft() override;
   int Execute() override;
   void Finish(int status) override;
 
  private:
+  enum class PatchDest {
+    InPlace,
+    Draft,
+  };
+
   int LoadSourceFile(FILE* ofile);
+
+  // This consumes the patch, so it may only be called once.
+  int ApplyPatchTo(PatchDest aDest);
 
   static int sPatchIndex;
 
@@ -1898,24 +2091,57 @@ int PatchFile::Prepare() {
     LOG(("Couldn't lock patch file: %lu", GetLastError()));
     return LOCK_ERROR_PATCH_FILE;
   }
-
-  char sourcefile[MAXPATHLEN];
-  if (!WideCharToMultiByte(CP_UTF8, 0, mPatchFile, -1, sourcefile, MAXPATHLEN,
-                           nullptr, nullptr)) {
-    LOG(("error converting wchar to utf8: %lu", GetLastError()));
-    return STRING_CONVERSION_ERROR;
-  }
-
-  int rv = gArchiveReader.ExtractFileToStream(sourcefile, mPatchStream);
-#else
-  int rv = gArchiveReader.ExtractFileToStream(mPatchFile, mPatchStream);
 #endif
 
-  return rv;
+  return extract_file_to_stream(mPatchFile, mPatchStream);
+}
+
+int PatchFile::Draft() {
+  // Logged before the staged update check on purpose: staged and non-staged
+  // updater tests compare against the same expected update logs.
+  LOG(("DRAFT PATCH " LOG_S, mFileRelPath.get()));
+
+  if (sStagedUpdate) {
+    return OK;
+  }
+
+  // Get rid of a draft that a previous updater instance left behind. Its mode
+  // doesn't matter, because ApplyPatchTo sets the mode of the draft it writes,
+  // but on Windows ApplyPatchTo opens the draft exclusively, so an undeletable
+  // one has to be moved out of the way first, which is what draft_discard does.
+  int rv = draft_discard(mFile.get(), mFileRelPath.get());
+  if (rv) {
+    return rv;
+  }
+
+  return ApplyPatchTo(PatchDest::Draft);
 }
 
 int PatchFile::Execute() {
   LOG(("EXECUTE PATCH " LOG_S, mFileRelPath.get()));
+
+  if (!sStagedUpdate) {
+    // The new contents have already been written during the Draft phase. Rename
+    // the destination file so that it can be used to restore the file to its
+    // original state if there is an error, then move the new contents in place.
+    int rv = backup_create(mFile.get());
+    if (rv) {
+      return rv;
+    }
+
+    return draft_commit(mFile.get());
+  }
+
+  return ApplyPatchTo(PatchDest::InPlace);
+}
+
+int PatchFile::ApplyPatchTo(PatchDest aDest) {
+  NS_tchar draft[MAXPATHLEN];
+  if (aDest == PatchDest::Draft && !draft_path(draft, mFile.get())) {
+    LOG(("draft path too long for: " LOG_S, mFileRelPath.get()));
+    return USAGE_ERROR;
+  }
+  const NS_tchar* destPath = aDest == PatchDest::Draft ? draft : mFile.get();
 
   int rv = UNEXPECTED_BSPATCH_ERROR;
 
@@ -1966,8 +2192,7 @@ int PatchFile::Execute() {
     return rv;
   }
 
-  // Rename the destination file if it exists before proceeding so it can be
-  // used to restore the file to its original state if there is an error.
+  // The new file inherits the mode of the file that we are patching.
   struct NS_tstat_t ss;
   rv = NS_tstat(mFile.get(), &ss);
   if (rv) {
@@ -1976,18 +2201,19 @@ int PatchFile::Execute() {
     return READ_ERROR;
   }
 
-  // Staged updates don't need backup files.
-  if (!sStagedUpdate) {
-    rv = backup_create(mFile.get());
-    if (rv) {
-      return rv;
-    }
+  unsigned int destMode = ss.st_mode;
+#ifdef XP_WIN
+  if (aDest == PatchDest::Draft) {
+    // _wstat derives the execute bits from the extension, which the draft file
+    // doesn't have. They come back on their own once it is renamed into place.
+    destMode &= ~(unsigned int)(_S_IEXEC | (_S_IEXEC >> 3) | (_S_IEXEC >> 6));
   }
+#endif
 
   off_t dlen = mPatchFileDecoder->DestinationSize();
 
 #if defined(HAVE_POSIX_FALLOCATE)
-  AutoFile ofile(ensure_open(mFile.get(), NS_T("wb+"), ss.st_mode));
+  AutoFile ofile(ensure_open(destPath, NS_T("wb+"), destMode));
   posix_fallocate(fileno((FILE*)ofile), 0, dlen);
 #elif defined(XP_WIN)
   bool shouldTruncate = true;
@@ -1999,8 +2225,8 @@ int PatchFile::Execute() {
   // 2. _get_osfhandle and then setting the size reduced fragmentation though
   //    not completely. There are also reports of _get_osfhandle failing on
   //    mingw.
-  HANDLE hfile = CreateFileW(mFile.get(), GENERIC_WRITE, 0, nullptr,
-                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  HANDLE hfile = CreateFileW(destPath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
 
   if (hfile != INVALID_HANDLE_VALUE) {
     if (SetFilePointer(hfile, dlen, nullptr, FILE_BEGIN) !=
@@ -2012,9 +2238,9 @@ int PatchFile::Execute() {
   }
 
   AutoFile ofile(ensure_open(
-      mFile.get(), shouldTruncate ? NS_T("wb+") : NS_T("rb+"), ss.st_mode));
+      destPath, shouldTruncate ? NS_T("wb+") : NS_T("rb+"), destMode));
 #elif defined(XP_MACOSX)
-  AutoFile ofile(ensure_open(mFile.get(), NS_T("wb+"), ss.st_mode));
+  AutoFile ofile(ensure_open(destPath, NS_T("wb+"), destMode));
   // Modified code from FileUtils.cpp
   fstore_t store = {F_ALLOCATECONTIG, F_PEOFPOSMODE, 0, dlen};
   // Try to get a continous chunk of disk space
@@ -2029,7 +2255,7 @@ int PatchFile::Execute() {
     ftruncate(fileno((FILE*)ofile), dlen);
   }
 #else
-  AutoFile ofile(ensure_open(mFile.get(), NS_T("wb+"), ss.st_mode));
+  AutoFile ofile(ensure_open(destPath, NS_T("wb+"), destMode));
 #endif
 
   if (ofile == nullptr) {
@@ -2075,6 +2301,10 @@ void PatchFile::Finish(int status) {
 
   // Staged updates don't create backup files.
   if (!sStagedUpdate) {
+    // Get rid of the new contents if they were never moved into place, which
+    // happens when the update failed before or during the Execute phase.
+    draft_discard(mFile.get(), mFileRelPath.get());
+
     backup_finish(mFile.get(), mFileRelPath.get(), status);
   }
 }
@@ -2083,6 +2313,7 @@ class AddIfFile : public AddFile {
  public:
   int Parse(NS_tchar* line) override;
   int Prepare() override;
+  int Draft() override;
   int Execute() override;
   void Finish(int status) override;
 
@@ -2117,6 +2348,14 @@ int AddIfFile::Prepare() {
   return AddFile::Prepare();
 }
 
+int AddIfFile::Draft() {
+  if (!mTestFile) {
+    return OK;
+  }
+
+  return AddFile::Draft();
+}
+
 int AddIfFile::Execute() {
   if (!mTestFile) {
     return OK;
@@ -2137,6 +2376,7 @@ class AddIfNotFile : public AddFile {
  public:
   int Parse(NS_tchar* line) override;
   int Prepare() override;
+  int Draft() override;
   int Execute() override;
   void Finish(int status) override;
 
@@ -2171,6 +2411,14 @@ int AddIfNotFile::Prepare() {
   return AddFile::Prepare();
 }
 
+int AddIfNotFile::Draft() {
+  if (!mTestFile) {
+    return OK;
+  }
+
+  return AddFile::Draft();
+}
+
 int AddIfNotFile::Execute() {
   if (!mTestFile) {
     return OK;
@@ -2191,6 +2439,7 @@ class PatchIfFile : public PatchFile {
  public:
   int Parse(NS_tchar* line) override;
   int Prepare() override;  // should check for patch file and for checksum here
+  int Draft() override;
   int Execute() override;
   void Finish(int status) override;
 
@@ -2223,6 +2472,14 @@ int PatchIfFile::Prepare() {
   }
 
   return PatchFile::Prepare();
+}
+
+int PatchIfFile::Draft() {
+  if (!mTestFile) {
+    return OK;
+  }
+
+  return PatchFile::Draft();
 }
 
 int PatchIfFile::Execute() {
@@ -4670,6 +4927,7 @@ class ActionList {
 
   void Append(Action* action);
   int Prepare();
+  int Draft();
   int Execute();
   void Finish(int status);
 
@@ -4725,6 +4983,32 @@ int ActionList::Prepare() {
   return OK;
 }
 
+int ActionList::Draft() {
+  int currentProgress = 0, maxProgress = 0;
+  Action* a = mFirst;
+  while (a) {
+    maxProgress += a->mProgressCost;
+    a = a->mNext;
+  }
+
+  a = mFirst;
+  while (a) {
+    int rv = a->Draft();
+    if (rv) {
+      LOG(("### draft failed"));
+      return rv;
+    }
+
+    currentProgress += a->mProgressCost;
+    float percent = float(currentProgress) / float(maxProgress);
+    UpdateProgressUI(PROGRESS_PREPARE_SIZE + PROGRESS_DRAFT_SIZE * percent);
+
+    a = a->mNext;
+  }
+
+  return OK;
+}
+
 int ActionList::Execute() {
   int currentProgress = 0, maxProgress = 0;
   Action* a = mFirst;
@@ -4743,7 +5027,8 @@ int ActionList::Execute() {
 
     currentProgress += a->mProgressCost;
     float percent = float(currentProgress) / float(maxProgress);
-    UpdateProgressUI(PROGRESS_PREPARE_SIZE + PROGRESS_EXECUTE_SIZE * percent);
+    UpdateProgressUI(PROGRESS_PREPARE_SIZE + PROGRESS_DRAFT_SIZE +
+                     PROGRESS_EXECUTE_SIZE * percent);
 
     a = a->mNext;
   }
@@ -4758,8 +5043,8 @@ void ActionList::Finish(int status) {
     a->Finish(status);
 
     float percent = float(++i) / float(mCount);
-    UpdateProgressUI(PROGRESS_PREPARE_SIZE + PROGRESS_EXECUTE_SIZE +
-                     PROGRESS_FINISH_SIZE * percent);
+    UpdateProgressUI(PROGRESS_PREPARE_SIZE + PROGRESS_DRAFT_SIZE +
+                     PROGRESS_EXECUTE_SIZE + PROGRESS_FINISH_SIZE * percent);
 
     a = a->mNext;
   }
@@ -5315,7 +5600,10 @@ int DoUpdate() {
     return rv;
   }
 
-  rv = list.Execute();
+  rv = list.Draft();
+  if (rv == OK) {
+    rv = list.Execute();
+  }
 
   list.Finish(rv);
   free(buf);
