@@ -1,0 +1,1596 @@
+diff --git a/dom/events/DataTransfer.cpp b/dom/events/DataTransfer.cpp
+index d5e9e5c5..35febdec 100644
+--- a/dom/events/DataTransfer.cpp
++++ b/dom/events/DataTransfer.cpp
+@@ -1046,14 +1046,28 @@ already_AddRefed<nsITransferable> DataTransfer::GetTransferable(
+   do {
+     for (uint32_t f = 0; f < count; f++) {
+       RefPtr<DataTransferItem> formatitem = item[f];
+-      nsCOMPtr<nsIVariant> variant = formatitem->DataNoSecurityCheck();
+-      if (!variant) {  // skip empty items
+-        continue;
+-      }
+ 
+       nsAutoString type;
+       formatitem->GetInternalType(type);
+ 
++      nsCOMPtr<nsIVariant> variant = formatitem->DataNoSecurityCheck();
++      if (!variant) {
++        // An external file promise has a known file kind before the native
++        // source is allowed to materialize it. Preserve that unresolved flavor
++        // in the second (known-format) pass so e10s can advertise "Files"
++        // during dragenter/dragover. The drop update replaces this placeholder
++        // with the real file data.
++        if (mIsExternal && !handlingCustomFormats &&
++            formatitem->Kind() == DataTransferItem::KIND_FILE &&
++            type.EqualsASCII(kFileMime)) {
++          if (NS_FAILED(transferable->AddDataFlavor(kFileMime))) {
++            return nullptr;
++          }
++          added = true;
++        }
++        continue;
++      }
++
+       // If the data is of one of the well-known formats, use it directly.
+       bool isCustomFormat = true;
+       for (const char* format : kKnownFormats) {
+diff --git a/dom/ipc/BrowserChild.cpp b/dom/ipc/BrowserChild.cpp
+index f390e5fa..c99762df 100644
+--- a/dom/ipc/BrowserChild.cpp
++++ b/dom/ipc/BrowserChild.cpp
+@@ -2133,6 +2133,18 @@ already_AddRefed<DataTransfer> BrowserChild::ConvertToDataTransfer(
+     aPrincipal = nsContentUtils::GetSystemPrincipal();
+   }
+ 
++  // The async transferable serializer represents a flavor-only item as an
++  // empty string. For kFileMime, retain that as a null, file-kind placeholder
++  // instead of converting it into string data.
++  auto isUnresolvedFile = [](const IPCTransferableDataItem& aItem) {
++    if (!aItem.flavor().EqualsLiteral(kFileMime) ||
++        aItem.data().type() !=
++            IPCTransferableDataType::TIPCTransferableDataString) {
++      return false;
++    }
++    return aItem.data().get_IPCTransferableDataString().data().Size() == 0;
++  };
++
+   // Check if we are receiving any file objects. If we are we will want
+   // to hide any of the other objects coming in from content.
+   bool hasFiles = false;
+@@ -2140,7 +2152,8 @@ already_AddRefed<DataTransfer> BrowserChild::ConvertToDataTransfer(
+     auto& items = aTransferables[i].items();
+     for (uint32_t j = 0; j < items.Length() && !hasFiles; ++j) {
+       if (items[j].data().type() ==
+-          IPCTransferableDataType::TIPCTransferableDataBlob) {
++              IPCTransferableDataType::TIPCTransferableDataBlob ||
++          isUnresolvedFile(items[j])) {
+         hasFiles = true;
+       }
+     }
+@@ -2152,20 +2165,25 @@ already_AddRefed<DataTransfer> BrowserChild::ConvertToDataTransfer(
+     auto& items = aTransferables[i].items();
+     for (uint32_t j = 0; j < items.Length(); ++j) {
+       const IPCTransferableDataItem& item = items[j];
++      bool unresolvedFile = isUnresolvedFile(item);
+       RefPtr<nsVariantCC> variant = new nsVariantCC();
+-      nsresult rv =
+-          nsContentUtils::IPCTransferableDataItemToVariant(item, variant);
+-      if (NS_FAILED(rv)) {
+-        continue;
++      if (!unresolvedFile) {
++        nsresult rv =
++            nsContentUtils::IPCTransferableDataItemToVariant(item, variant);
++        if (NS_FAILED(rv)) {
++          continue;
++        }
+       }
+ 
+       // We should hide this data from content if we have a file, and we
+       // aren't a file.
+-      bool hidden =
+-          hasFiles && item.data().type() !=
+-                          IPCTransferableDataType::TIPCTransferableDataBlob;
++      bool itemIsFile = unresolvedFile ||
++                        item.data().type() ==
++                            IPCTransferableDataType::TIPCTransferableDataBlob;
++      bool hidden = hasFiles && !itemIsFile;
+       dataTransfer->SetDataWithPrincipalFromOtherProcess(
+-          NS_ConvertUTF8toUTF16(item.flavor()), variant, i, aPrincipal, hidden);
++          NS_ConvertUTF8toUTF16(item.flavor()),
++          unresolvedFile ? nullptr : variant.get(), i, aPrincipal, hidden);
+     }
+   }
+   return dataTransfer.forget();
+diff --git a/widget/cocoa/nsChildView.mm b/widget/cocoa/nsChildView.mm
+index 2a0993dc..6b6acf57 100644
+--- a/widget/cocoa/nsChildView.mm
++++ b/widget/cocoa/nsChildView.mm
+@@ -4591,6 +4591,31 @@ - (void)draggingExited:(id<NSDraggingInfo>)sender {
+ // NSDraggingDestination
+ - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+   nsAutoRetainCocoaObject kungFuDeathGrip(self);
++
++  nsCOMPtr<nsIDragSession> dragSession;
++  if (mDragService) {
++    dragSession = mDragService->GetCurrentSession(mGeckoChild);
++  }
++
++  if (dragSession) {
++    // Do not ask the source application to export anything unless the web
++    // content accepted the drag during dragenter/dragover.
++    bool canDrop = false;
++    if (NS_FAILED(dragSession->GetCanDrop(&canDrop)) || !canDrop) {
++      [self doDragAction:eDrop sender:sender];
++      NS_IF_RELEASE(mDragService);
++      return NO;
++    }
++
++    nsDragSession* cocoaDragSession =
++        static_cast<nsDragSession*>(dragSession.get());
++    if (NS_FAILED(cocoaDragSession->MaterializePromisedFiles(sender))) {
++      [self doDragAction:eDragExit sender:sender];
++      NS_IF_RELEASE(mDragService);
++      return NO;
++    }
++  }
++
+   BOOL handled = [self doDragAction:eDrop sender:sender] != NSDragOperationNone;
+   NS_IF_RELEASE(mDragService);
+   return handled;
+diff --git a/widget/cocoa/nsDragService.h b/widget/cocoa/nsDragService.h
+index e7208b5e..db89ea4f 100644
+--- a/widget/cocoa/nsDragService.h
++++ b/widget/cocoa/nsDragService.h
+@@ -8,9 +8,13 @@
+ 
+ #include "nsBaseDragService.h"
+ #include "nsChildView.h"
++#include "nsCOMPtr.h"
++#include "nsTArray.h"
+ 
+ #include <Cocoa/Cocoa.h>
+ 
++class nsIFile;
++
+ /**
+  * Cocoa native nsIDragSession implementation
+  */
+@@ -30,6 +34,15 @@ class nsDragSession : public nsBaseDragSession {
+ 
+   NSDraggingSession* GetNSDraggingSession() { return mNSDraggingSession; }
+ 
++  // Materialize external file promises while performDragOperation: is active.
++  // This must happen before Gecko dispatches the DOM drop event so
++  // DataTransfer.files can contain the resulting files.
++  nsresult MaterializePromisedFiles(id<NSDraggingInfo> aDraggingInfo);
++
++  // File promises are not materialized during dragenter. Make e10s replace the
++  // dragenter-era DataTransfer before dispatching drop.
++  bool MustUpdateDataTransfer(mozilla::EventMessage aMessage) override;
++
+   MOZ_CAN_RUN_SCRIPT nsresult
+   EndDragSessionImpl(bool aDoneDrag, uint32_t aKeyModifiers) override;
+ 
+@@ -55,6 +68,11 @@ class nsDragSession : public nsBaseDragSession {
+ 
+   nsCOMPtr<nsIArray> mDataItems;  // only valid for a drag started within gecko
+ 
++  // Files created for an external file-promise drop. Their containing
++  // directory is retained by a process-lifetime cleanup owner so asynchronous
++  // web uploads can continue after the native drag session ends.
++  nsTArray<nsCOMPtr<nsIFile>> mPromisedFiles;
++
+   // Native widget object that this drag is over.
+   ChildView* mNativeDragView = nil;
+   // The native drag session object for this drag.
+diff --git a/widget/cocoa/nsDragService.mm b/widget/cocoa/nsDragService.mm
+index cc1ad470..7762273a 100644
+--- a/widget/cocoa/nsDragService.mm
++++ b/widget/cocoa/nsDragService.mm
+@@ -3,12 +3,27 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
++#include "mozilla/ClearOnShutdown.h"
++#include "mozilla/dom/DataTransfer.h"
+ #include "mozilla/Logging.h"
++#include "mozilla/ScopeExit.h"
++#include "mozilla/StaticPtr.h"
++#include "mozilla/UniquePtr.h"
++#include "mozilla/Unused.h"
++
++#include <Carbon/Carbon.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <stdint.h>
++#include <string.h>
++#include <sys/param.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <utility>
+ 
+ #include "gfxContext.h"
+ #include "nsArrayUtils.h"
+ #include "nsDragService.h"
+-#include "nsArrayUtils.h"
+ #include "nsObjCExceptions.h"
+ #include "nsITransferable.h"
+ #include "nsString.h"
+@@ -24,8 +39,12 @@
+ #include "mozilla/dom/Document.h"
+ #include "mozilla/dom/DocumentInlines.h"
+ #include "nsIContent.h"
++#include "nsIDirectoryEnumerator.h"
+ #include "nsView.h"
+ #include "nsCocoaUtils.h"
++#include "nsDirectoryServiceDefs.h"
++#include "nsDirectoryServiceUtils.h"
++#include "nsIFile.h"
+ #include "mozilla/gfx/2D.h"
+ #include "gfxPlatform.h"
+ #include "nsDeviceContext.h"
+@@ -40,6 +59,1051 @@
+ extern NSEvent* gLastDragMouseDownEvent;
+ extern bool gUserCancelledDrag;
+ 
++namespace {
++
++constexpr uint32_t kMaximumPromisedFileCount = 128;
++constexpr uint32_t kMaximumPromiseDirectoryEntries = 1024;
++constexpr CFIndex kMaximumPromiseMetadataBytes = 64 * 1024;
++constexpr off_t kMaximumPromisedFileBytes = 128 * 1024 * 1024;
++constexpr uint64_t kMaximumPromisedFileAggregateBytes =
++    256ULL * 1024ULL * 1024ULL;
++constexpr uint64_t kMaximumRetainedPromiseBytes = 512ULL * 1024ULL * 1024ULL;
++constexpr size_t kPromiseCopyBufferBytes = 32 * 1024;
++constexpr char kPrivatePromiseRootName[] = "momiji-promised-files-private";
++constexpr char kPromiseInboxName[] = "momiji-promised-files-inbox";
++constexpr char kPromiseSourceDirectoryName[] = "source";
++constexpr char kPromiseDeliveryDirectoryName[] = "delivery";
++
++struct PromisedFileDirectory {
++  nsCOMPtr<nsIFile> mDirectory;
++  dev_t mDevice;
++  ino_t mInode;
++};
++
++struct PromisedFilePath {
++  nsCOMPtr<nsIFile> mFile;
++  dev_t mDevice;
++  ino_t mInode;
++};
++
++bool SameDirectoryIdentity(const struct stat& aLeft, const struct stat& aRight);
++bool DirectoryDescriptorMatchesPath(int aDescriptor, nsIFile* aDirectory);
++
++bool RemoveRegularFileIfUnchanged(const PromisedFilePath& aEntry) {
++  nsAutoCString nativePath;
++  struct stat fileStatus;
++  if (NS_FAILED(aEntry.mFile->GetNativePath(nativePath)) ||
++      lstat(nativePath.get(), &fileStatus) != 0 ||
++      !S_ISREG(fileStatus.st_mode) || fileStatus.st_nlink != 1 ||
++      fileStatus.st_uid != geteuid() || fileStatus.st_dev != aEntry.mDevice ||
++      fileStatus.st_ino != aEntry.mInode) {
++    return false;
++  }
++
++  return NS_SUCCEEDED(aEntry.mFile->Remove(false));
++}
++
++class PromisedFileCleanup final {
++ public:
++  bool AddDirectory(nsIFile* aDirectory) {
++    MOZ_ASSERT(aDirectory);
++
++    nsAutoCString nativePath;
++    struct stat directoryStatus;
++    if (NS_FAILED(aDirectory->GetNativePath(nativePath)) ||
++        lstat(nativePath.get(), &directoryStatus) != 0 ||
++        !S_ISDIR(directoryStatus.st_mode) ||
++        directoryStatus.st_uid != geteuid() ||
++        (directoryStatus.st_mode & 077) != 0) {
++      return false;
++    }
++
++    PromisedFileDirectory entry;
++    entry.mDirectory = aDirectory;
++    entry.mDevice = directoryStatus.st_dev;
++    entry.mInode = directoryStatus.st_ino;
++    mDirectories.AppendElement(std::move(entry));
++    return true;
++  }
++
++  bool AddFiles(const nsTArray<PromisedFilePath>& aExpectedFiles) {
++    uint64_t additionalBytes = 0;
++    for (const auto& expectedFile : aExpectedFiles) {
++      MOZ_ASSERT(expectedFile.mFile);
++
++      nsCOMPtr<nsIFile> parent;
++      if (NS_FAILED(expectedFile.mFile->GetParent(getter_AddRefs(parent))) ||
++          !parent) {
++        return false;
++      }
++
++      bool parentIsTracked = false;
++      for (const auto& directory : mDirectories) {
++        bool isSameDirectory = false;
++        if (NS_SUCCEEDED(
++                parent->Equals(directory.mDirectory, &isSameDirectory)) &&
++            isSameDirectory) {
++          parentIsTracked = true;
++          break;
++        }
++      }
++      if (!parentIsTracked) {
++        return false;
++      }
++
++      nsAutoCString nativePath;
++      struct stat fileStatus;
++      if (NS_FAILED(expectedFile.mFile->GetNativePath(nativePath)) ||
++          lstat(nativePath.get(), &fileStatus) != 0 ||
++          !S_ISREG(fileStatus.st_mode) || fileStatus.st_nlink != 1 ||
++          fileStatus.st_uid != geteuid() || fileStatus.st_size < 0 ||
++          (fileStatus.st_mode & 0777) != 0600 ||
++          fileStatus.st_dev != expectedFile.mDevice ||
++          fileStatus.st_ino != expectedFile.mInode) {
++        return false;
++      }
++
++      uint64_t fileBytes = static_cast<uint64_t>(fileStatus.st_size);
++      if (mRetainedBytes > kMaximumRetainedPromiseBytes ||
++          additionalBytes > kMaximumRetainedPromiseBytes - mRetainedBytes ||
++          fileBytes >
++              kMaximumRetainedPromiseBytes - mRetainedBytes - additionalBytes) {
++        return false;
++      }
++      additionalBytes += fileBytes;
++    }
++
++    mFiles.AppendElements(aExpectedFiles);
++    mRetainedBytes += additionalBytes;
++    return true;
++  }
++
++  bool TrackRelocationDestination(nsIFile* aOldDirectory,
++                                  nsIFile* aNewDirectory, int aDescriptor) {
++    MOZ_ASSERT(aOldDirectory);
++    MOZ_ASSERT(aNewDirectory);
++
++    nsAutoCString oldPath;
++    nsAutoCString newPath;
++    struct stat descriptorStatus;
++    struct stat oldPathStatus;
++    struct stat unexpectedDestination;
++    if (aDescriptor < 0 || NS_FAILED(aOldDirectory->GetNativePath(oldPath)) ||
++        NS_FAILED(aNewDirectory->GetNativePath(newPath)) ||
++        fstat(aDescriptor, &descriptorStatus) != 0 ||
++        lstat(oldPath.get(), &oldPathStatus) != 0 ||
++        !SameDirectoryIdentity(descriptorStatus, oldPathStatus) ||
++        lstat(newPath.get(), &unexpectedDestination) == 0 || errno != ENOENT) {
++      return false;
++    }
++
++    bool foundOldDirectory = false;
++    for (const auto& entry : mDirectories) {
++      nsAutoCString entryPath;
++      if (NS_SUCCEEDED(entry.mDirectory->GetNativePath(entryPath))) {
++        if (entryPath.Equals(newPath)) {
++          return false;
++        }
++        if (entry.mDevice == descriptorStatus.st_dev &&
++            entry.mInode == descriptorStatus.st_ino &&
++            entryPath.Equals(oldPath)) {
++          foundOldDirectory = true;
++        }
++      }
++    }
++    if (!foundOldDirectory) {
++      return false;
++    }
++
++    // Register the destination before rename(). At every point, shutdown
++    // cleanup therefore knows every path at which this exact directory may
++    // reside, even if a post-rename identity check fails.
++    PromisedFileDirectory destinationEntry;
++    destinationEntry.mDirectory = aNewDirectory;
++    destinationEntry.mDevice = descriptorStatus.st_dev;
++    destinationEntry.mInode = descriptorStatus.st_ino;
++    mDirectories.AppendElement(std::move(destinationEntry));
++    return true;
++  }
++
++  bool RemoveDirectoryNow(nsIFile* aDirectory) {
++    MOZ_ASSERT(aDirectory);
++
++    nsAutoCString nativePath;
++    if (NS_FAILED(aDirectory->GetNativePath(nativePath))) {
++      return false;
++    }
++
++    for (size_t index = 0; index < mDirectories.Length(); ++index) {
++      auto& entry = mDirectories[index];
++      nsAutoCString entryPath;
++      struct stat directoryStatus;
++      if (NS_FAILED(entry.mDirectory->GetNativePath(entryPath)) ||
++          !entryPath.Equals(nativePath) ||
++          lstat(nativePath.get(), &directoryStatus) != 0 ||
++          !S_ISDIR(directoryStatus.st_mode) ||
++          directoryStatus.st_uid != geteuid() ||
++          (directoryStatus.st_mode & 077) != 0 ||
++          directoryStatus.st_dev != entry.mDevice ||
++          directoryStatus.st_ino != entry.mInode) {
++        continue;
++      }
++
++      if (NS_FAILED(entry.mDirectory->Remove(false))) {
++        return false;
++      }
++      mDirectories.RemoveElementAt(index);
++      return true;
++    }
++    return false;
++  }
++
++  bool ForgetDirectoryPath(nsIFile* aDirectory) {
++    MOZ_ASSERT(aDirectory);
++
++    nsAutoCString nativePath;
++    if (NS_FAILED(aDirectory->GetNativePath(nativePath))) {
++      return false;
++    }
++    for (size_t index = 0; index < mDirectories.Length(); ++index) {
++      nsAutoCString entryPath;
++      if (NS_SUCCEEDED(
++              mDirectories[index].mDirectory->GetNativePath(entryPath)) &&
++          entryPath.Equals(nativePath)) {
++        mDirectories.RemoveElementAt(index);
++        return true;
++      }
++    }
++    return false;
++  }
++
++  ~PromisedFileCleanup() {
++    // Never recursively remove a path that was disclosed to another process.
++    // Delete only direct leaf files whose identities are unchanged, followed
++    // by now-empty tracked directories. Unknown or replaced entries are left
++    // for the operating system's temporary-directory policy.
++    for (const auto& entry : mFiles) {
++      Unused << RemoveRegularFileIfUnchanged(entry);
++    }
++
++    for (size_t index = mDirectories.Length(); index > 0; --index) {
++      const auto& entry = mDirectories[index - 1];
++      nsAutoCString nativePath;
++      struct stat directoryStatus;
++      if (NS_SUCCEEDED(entry.mDirectory->GetNativePath(nativePath)) &&
++          lstat(nativePath.get(), &directoryStatus) == 0 &&
++          S_ISDIR(directoryStatus.st_mode) &&
++          directoryStatus.st_uid == geteuid() &&
++          (directoryStatus.st_mode & 077) == 0 &&
++          directoryStatus.st_dev == entry.mDevice &&
++          directoryStatus.st_ino == entry.mInode) {
++        Unused << entry.mDirectory->Remove(false);
++      }
++    }
++  }
++
++ private:
++  nsTArray<PromisedFilePath> mFiles;
++  nsTArray<PromisedFileDirectory> mDirectories;
++  uint64_t mRetainedBytes = 0;
++};
++
++StaticAutoPtr<PromisedFileCleanup> sPromisedFileCleanup;
++
++void EnsurePromisedFileCleanup() {
++  MOZ_ASSERT(NS_IsMainThread());
++  if (!sPromisedFileCleanup) {
++    sPromisedFileCleanup = new PromisedFileCleanup();
++    ClearOnShutdown(&sPromisedFileCleanup, ShutdownPhase::AppShutdownConfirmed);
++  }
++}
++
++bool KeepPromisedFileDirectoryUntilShutdown(nsIFile* aDirectory) {
++  EnsurePromisedFileCleanup();
++  return sPromisedFileCleanup->AddDirectory(aDirectory);
++}
++
++bool KeepPromisedFilesUntilShutdown(const nsTArray<PromisedFilePath>& aFiles) {
++  EnsurePromisedFileCleanup();
++  return sPromisedFileCleanup->AddFiles(aFiles);
++}
++
++bool TrackPromisedFileDirectoryRelocationDestination(nsIFile* aOldDirectory,
++                                                     nsIFile* aNewDirectory,
++                                                     int aDescriptor) {
++  EnsurePromisedFileCleanup();
++  return sPromisedFileCleanup->TrackRelocationDestination(
++      aOldDirectory, aNewDirectory, aDescriptor);
++}
++
++bool RemoveTrackedPromisedFileDirectoryNow(nsIFile* aDirectory) {
++  EnsurePromisedFileCleanup();
++  return sPromisedFileCleanup->RemoveDirectoryNow(aDirectory);
++}
++
++bool ForgetTrackedPromisedFileDirectoryPath(nsIFile* aDirectory) {
++  EnsurePromisedFileCleanup();
++  return sPromisedFileCleanup->ForgetDirectoryPath(aDirectory);
++}
++
++class PendingPromisedFiles final {
++ public:
++  void AddSource(nsIFile* aFile, const struct stat& aStatus) {
++    Add(aFile, aStatus, mSources);
++  }
++
++  void AddDelivery(nsIFile* aFile, const struct stat& aStatus) {
++    Add(aFile, aStatus, mDeliveries);
++  }
++
++  bool RemoveSourcesNow() {
++    bool removedAll = true;
++    for (const auto& entry : mSources) {
++      if (!RemoveRegularFileIfUnchanged(entry)) {
++        removedAll = false;
++      }
++    }
++    return removedAll;
++  }
++
++  bool RetainDeliveriesUntilShutdown() {
++    if (!KeepPromisedFilesUntilShutdown(mDeliveries)) {
++      return false;
++    }
++    mCommitted = true;
++    return true;
++  }
++
++  ~PendingPromisedFiles() {
++    if (mCommitted) {
++      return;
++    }
++    for (const auto& entry : mDeliveries) {
++      Unused << RemoveRegularFileIfUnchanged(entry);
++    }
++    for (const auto& entry : mSources) {
++      Unused << RemoveRegularFileIfUnchanged(entry);
++    }
++  }
++
++ private:
++  static void Add(nsIFile* aFile, const struct stat& aStatus,
++                  nsTArray<PromisedFilePath>& aEntries) {
++    for (const auto& entry : aEntries) {
++      if (entry.mDevice == aStatus.st_dev && entry.mInode == aStatus.st_ino) {
++        return;
++      }
++    }
++
++    PromisedFilePath entry;
++    entry.mFile = aFile;
++    entry.mDevice = aStatus.st_dev;
++    entry.mInode = aStatus.st_ino;
++    aEntries.AppendElement(std::move(entry));
++  }
++
++  nsTArray<PromisedFilePath> mSources;
++  nsTArray<PromisedFilePath> mDeliveries;
++  bool mCommitted = false;
++};
++
++nsresult InventoryDirectPromiseFiles(nsIFile* aSourceDirectory,
++                                     int aSourceDirectoryDescriptor,
++                                     PendingPromisedFiles& aPendingFiles) {
++  if (!DirectoryDescriptorMatchesPath(aSourceDirectoryDescriptor,
++                                      aSourceDirectory)) {
++    return NS_ERROR_FAILURE;
++  }
++
++  nsCOMPtr<nsIDirectoryEnumerator> entries;
++  nsresult rv = aSourceDirectory->GetDirectoryEntries(getter_AddRefs(entries));
++  if (NS_FAILED(rv) || !entries) {
++    return NS_FAILED(rv) ? rv : NS_ERROR_FAILURE;
++  }
++  auto closeEntries =
++      MakeScopeExit([&entries]() { Unused << entries->Close(); });
++
++  uint32_t entryCount = 0;
++  while (true) {
++    nsCOMPtr<nsIFile> entry;
++    rv = entries->GetNextFile(getter_AddRefs(entry));
++    if (NS_FAILED(rv)) {
++      return rv;
++    }
++    if (!entry) {
++      break;
++    }
++    if (++entryCount > kMaximumPromiseDirectoryEntries) {
++      return NS_ERROR_FAILURE;
++    }
++
++    nsCOMPtr<nsIFile> parent;
++    bool parentMatches = false;
++    if (NS_FAILED(entry->GetParent(getter_AddRefs(parent))) || !parent ||
++        NS_FAILED(parent->Equals(aSourceDirectory, &parentMatches)) ||
++        !parentMatches) {
++      return NS_ERROR_FAILURE;
++    }
++
++    nsAutoCString nativePath;
++    struct stat entryStatus;
++    if (NS_FAILED(entry->GetNativePath(nativePath)) ||
++        lstat(nativePath.get(), &entryStatus) != 0) {
++      return NS_ERROR_FAILURE;
++    }
++    if (S_ISREG(entryStatus.st_mode) && entryStatus.st_uid == geteuid() &&
++        entryStatus.st_nlink == 1) {
++      aPendingFiles.AddSource(entry, entryStatus);
++    }
++  }
++
++  return DirectoryDescriptorMatchesPath(aSourceDirectoryDescriptor,
++                                        aSourceDirectory)
++             ? NS_OK
++             : NS_ERROR_FAILURE;
++}
++
++void CleanupFailedPromiseDirectory(nsIFile* aDirectory,
++                                   int aDirectoryDescriptor) {
++  if (!aDirectory) {
++    return;
++  }
++
++  Unused << fchmod(aDirectoryDescriptor, 0700);
++  PendingPromisedFiles pendingFiles;
++  if (NS_SUCCEEDED(InventoryDirectPromiseFiles(aDirectory, aDirectoryDescriptor,
++                                               pendingFiles)) &&
++      pendingFiles.RemoveSourcesNow()) {
++    if (!RemoveTrackedPromisedFileDirectoryNow(aDirectory) &&
++        DirectoryDescriptorMatchesPath(aDirectoryDescriptor, aDirectory)) {
++      // A tracking inconsistency must not strand an otherwise verified,
++      // empty directory. This remains an exact, non-recursive removal.
++      Unused << aDirectory->Remove(false);
++    }
++  }
++}
++
++bool PasteboardHasModernFilePromise(NSPasteboard* aPasteboard) {
++  return aPasteboard &&
++         [[aPasteboard types]
++             containsObject:(NSString*)kPasteboardTypeFileURLPromise];
++}
++
++uint32_t ModernFilePromiseCount(NSPasteboard* aPasteboard) {
++  if (!PasteboardHasModernFilePromise(aPasteboard)) {
++    return 0;
++  }
++
++  NSString* pasteboardName = [aPasteboard name];
++  if (!pasteboardName) {
++    return 0;
++  }
++
++  PasteboardRef carbonPasteboard = nullptr;
++  OSStatus status =
++      PasteboardCreate((CFStringRef)pasteboardName, &carbonPasteboard);
++  if (!carbonPasteboard) {
++    return 0;
++  }
++  auto releasePasteboard =
++      MakeScopeExit([carbonPasteboard]() { CFRelease(carbonPasteboard); });
++  if (status != noErr) {
++    return 0;
++  }
++
++  PasteboardSynchronize(carbonPasteboard);
++  ItemCount itemCount = 0;
++  status = PasteboardGetItemCount(carbonPasteboard, &itemCount);
++  if (status != noErr || itemCount > kMaximumPromisedFileCount) {
++    return 0;
++  }
++
++  for (ItemCount index = 1; index <= itemCount; ++index) {
++    PasteboardItemID itemIdentifier = nullptr;
++    PasteboardFlavorFlags flags = 0;
++    if (PasteboardGetItemIdentifier(carbonPasteboard, index, &itemIdentifier) !=
++            noErr ||
++        PasteboardGetItemFlavorFlags(carbonPasteboard, itemIdentifier,
++                                     kPasteboardTypeFileURLPromise,
++                                     &flags) != noErr) {
++      return 0;
++    }
++  }
++
++  return static_cast<uint32_t>(itemCount);
++}
++
++uint32_t FilePromiseCount(NSPasteboard* aPasteboard) {
++  return ModernFilePromiseCount(aPasteboard);
++}
++
++bool SameDirectoryIdentity(const struct stat& aLeft,
++                           const struct stat& aRight) {
++  return S_ISDIR(aLeft.st_mode) && S_ISDIR(aRight.st_mode) &&
++         aLeft.st_uid == geteuid() && aRight.st_uid == geteuid() &&
++         (aLeft.st_mode & 077) == 0 && (aRight.st_mode & 077) == 0 &&
++         aLeft.st_dev == aRight.st_dev && aLeft.st_ino == aRight.st_ino;
++}
++
++bool SameRegularFileState(const struct stat& aLeft, const struct stat& aRight) {
++  return S_ISREG(aLeft.st_mode) && S_ISREG(aRight.st_mode) &&
++         aLeft.st_uid == geteuid() && aRight.st_uid == geteuid() &&
++         aLeft.st_nlink == 1 && aRight.st_nlink == 1 &&
++         aLeft.st_dev == aRight.st_dev && aLeft.st_ino == aRight.st_ino &&
++         aLeft.st_size == aRight.st_size && aLeft.st_mode == aRight.st_mode &&
++         aLeft.st_mtimespec.tv_sec == aRight.st_mtimespec.tv_sec &&
++         aLeft.st_mtimespec.tv_nsec == aRight.st_mtimespec.tv_nsec &&
++         aLeft.st_ctimespec.tv_sec == aRight.st_ctimespec.tv_sec &&
++         aLeft.st_ctimespec.tv_nsec == aRight.st_ctimespec.tv_nsec;
++}
++
++bool DirectoryDescriptorMatchesPath(int aDescriptor, nsIFile* aDirectory) {
++  nsAutoCString nativePath;
++  struct stat descriptorStatus;
++  struct stat pathStatus;
++  return aDescriptor >= 0 &&
++         NS_SUCCEEDED(aDirectory->GetNativePath(nativePath)) &&
++         fstat(aDescriptor, &descriptorStatus) == 0 &&
++         lstat(nativePath.get(), &pathStatus) == 0 &&
++         SameDirectoryIdentity(descriptorStatus, pathStatus);
++}
++
++bool FileDescriptorMatchesPath(int aDescriptor, nsIFile* aFile,
++                               const struct stat& aExpectedStatus) {
++  nsAutoCString nativePath;
++  struct stat descriptorStatus;
++  struct stat pathStatus;
++  return aDescriptor >= 0 && NS_SUCCEEDED(aFile->GetNativePath(nativePath)) &&
++         fstat(aDescriptor, &descriptorStatus) == 0 &&
++         lstat(nativePath.get(), &pathStatus) == 0 &&
++         SameRegularFileState(descriptorStatus, aExpectedStatus) &&
++         SameRegularFileState(pathStatus, aExpectedStatus);
++}
++
++nsresult OpenPrivateDirectory(nsIFile* aDirectory, int* aDescriptor) {
++  MOZ_ASSERT(aDirectory);
++  MOZ_ASSERT(aDescriptor);
++
++  *aDescriptor = -1;
++  nsAutoCString nativePath;
++  if (NS_FAILED(aDirectory->GetNativePath(nativePath))) {
++    return NS_ERROR_FAILURE;
++  }
++
++  int descriptor =
++      open(nativePath.get(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
++  if (descriptor < 0 ||
++      !DirectoryDescriptorMatchesPath(descriptor, aDirectory)) {
++    if (descriptor >= 0) {
++      close(descriptor);
++    }
++    return NS_ERROR_FAILURE;
++  }
++
++  *aDescriptor = descriptor;
++  return NS_OK;
++}
++
++nsresult CreatePrivateDirectory(nsIFile* aParent, const char* aName,
++                                bool aCreateUnique,
++                                nsCOMPtr<nsIFile>& aDirectory) {
++  nsCOMPtr<nsIFile> directory;
++  nsresult rv = aParent->Clone(getter_AddRefs(directory));
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++
++  rv = directory->AppendNative(nsDependentCString(aName));
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++
++  rv = aCreateUnique ? directory->CreateUnique(nsIFile::DIRECTORY_TYPE, 0700)
++                     : directory->Create(nsIFile::DIRECTORY_TYPE, 0700);
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++
++  int descriptor = -1;
++  rv = OpenPrivateDirectory(directory, &descriptor);
++  if (NS_FAILED(rv)) {
++    Unused << directory->Remove(false);
++    return rv;
++  }
++  auto closeDirectory =
++      MakeScopeExit([descriptor]() { Unused << close(descriptor); });
++
++  if (fchmod(descriptor, 0700) != 0 ||
++      !DirectoryDescriptorMatchesPath(descriptor, directory) ||
++      !KeepPromisedFileDirectoryUntilShutdown(directory)) {
++    // This path has not been disclosed and no source data has been written.
++    Unused << directory->Remove(false);
++    return NS_ERROR_FAILURE;
++  }
++
++  aDirectory = directory;
++  return NS_OK;
++}
++
++nsresult ValidatePromiseURLAndAppendName(NSURL* aFileURL,
++                                         NSString* aStandardDestinationPath,
++                                         nsTArray<nsString>& aPromisedNames) {
++  if (!aFileURL || ![aFileURL isFileURL] || [aFileURL query] ||
++      [aFileURL fragment]) {
++    return NS_ERROR_FAILURE;
++  }
++
++  NSString* host = [aFileURL host];
++  if (host && [host length] &&
++      [host caseInsensitiveCompare:@"localhost"] != NSOrderedSame) {
++    return NS_ERROR_FAILURE;
++  }
++
++  NSString* path = [aFileURL path];
++  NSString* standardPath = [path stringByStandardizingPath];
++  NSString* name = [standardPath lastPathComponent];
++  if (![standardPath isAbsolutePath] || ![name length] ||
++      [name isEqualToString:@"."] || [name isEqualToString:@".."] ||
++      ![[name lastPathComponent] isEqualToString:name] ||
++      ![[standardPath stringByDeletingLastPathComponent]
++          isEqualToString:aStandardDestinationPath]) {
++    return NS_ERROR_FAILURE;
++  }
++
++  nsAutoString promisedName;
++  nsCocoaUtils::GetStringForNSString(name, promisedName);
++  if (promisedName.IsEmpty() || promisedName.FindChar(u'\0') != kNotFound) {
++    return NS_ERROR_FAILURE;
++  }
++
++  for (const auto& otherName : aPromisedNames) {
++    if (promisedName.Equals(otherName)) {
++      return NS_ERROR_FAILURE;
++    }
++  }
++
++  aPromisedNames.AppendElement(promisedName);
++  return NS_OK;
++}
++
++nsresult RelocatePromiseDirectory(nsIFile* aInboxDirectory,
++                                  int aInboxDescriptor, nsIFile* aPrivateRoot,
++                                  int aPrivateRootDescriptor,
++                                  nsCOMPtr<nsIFile>& aSourceDirectory) {
++  if (!DirectoryDescriptorMatchesPath(aInboxDescriptor, aInboxDirectory) ||
++      !DirectoryDescriptorMatchesPath(aPrivateRootDescriptor, aPrivateRoot)) {
++    return NS_ERROR_FAILURE;
++  }
++
++  nsCOMPtr<nsIFile> sourceDirectory;
++  nsresult rv = aPrivateRoot->Clone(getter_AddRefs(sourceDirectory));
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++  rv = sourceDirectory->AppendNative(
++      nsDependentCString(kPromiseSourceDirectoryName));
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++
++  nsAutoCString inboxPath;
++  nsAutoCString sourcePath;
++  if (NS_FAILED(aInboxDirectory->GetNativePath(inboxPath)) ||
++      NS_FAILED(sourceDirectory->GetNativePath(sourcePath))) {
++    return NS_ERROR_FAILURE;
++  }
++
++  struct stat unexpectedDestination;
++  if (lstat(sourcePath.get(), &unexpectedDestination) == 0 || errno != ENOENT) {
++    return NS_ERROR_FAILURE;
++  }
++
++  if (!TrackPromisedFileDirectoryRelocationDestination(
++          aInboxDirectory, sourceDirectory, aInboxDescriptor)) {
++    return NS_ERROR_FAILURE;
++  }
++
++  if (rename(inboxPath.get(), sourcePath.get()) != 0) {
++    Unused << ForgetTrackedPromisedFileDirectoryPath(sourceDirectory);
++    return NS_ERROR_FAILURE;
++  }
++
++  // Returning this best-known path on later failure lets the caller attempt
++  // descriptor-verified cleanup; the pre-registered identity also remains a
++  // safe shutdown fallback if verification cannot be repeated.
++  aSourceDirectory = sourceDirectory;
++
++  struct stat descriptorStatus;
++  struct stat sourceStatus;
++  if (fstat(aInboxDescriptor, &descriptorStatus) != 0 ||
++      lstat(sourcePath.get(), &sourceStatus) != 0 ||
++      !SameDirectoryIdentity(descriptorStatus, sourceStatus)) {
++    return NS_ERROR_FAILURE;
++  }
++
++  if (!ForgetTrackedPromisedFileDirectoryPath(aInboxDirectory)) {
++    return NS_ERROR_FAILURE;
++  }
++
++  if (!DirectoryDescriptorMatchesPath(aPrivateRootDescriptor, aPrivateRoot) ||
++      fchmod(aInboxDescriptor, 0500) != 0) {
++    return NS_ERROR_FAILURE;
++  }
++
++  return NS_OK;
++}
++
++ssize_t ReadAt(int aDescriptor, void* aBuffer, size_t aLength, off_t aOffset) {
++  ssize_t result;
++  do {
++    result = pread(aDescriptor, aBuffer, aLength, aOffset);
++  } while (result < 0 && errno == EINTR);
++  return result;
++}
++
++bool ReadExactlyAt(int aDescriptor, void* aBuffer, size_t aLength,
++                   off_t aOffset) {
++  size_t completed = 0;
++  while (completed < aLength) {
++    ssize_t result =
++        ReadAt(aDescriptor, static_cast<char*>(aBuffer) + completed,
++               aLength - completed, aOffset + completed);
++    if (result <= 0) {
++      return false;
++    }
++    completed += static_cast<size_t>(result);
++  }
++  return true;
++}
++
++bool WriteExactlyAt(int aDescriptor, const void* aBuffer, size_t aLength,
++                    off_t aOffset) {
++  size_t completed = 0;
++  while (completed < aLength) {
++    ssize_t result;
++    do {
++      result =
++          pwrite(aDescriptor, static_cast<const char*>(aBuffer) + completed,
++                 aLength - completed, aOffset + completed);
++    } while (result < 0 && errno == EINTR);
++    if (result <= 0) {
++      return false;
++    }
++    completed += static_cast<size_t>(result);
++  }
++  return true;
++}
++
++nsresult SnapshotPromisedFile(
++    nsIFile* aSourceDirectory, int aSourceDirectoryDescriptor,
++    nsIFile* aDeliveryDirectory, int aDeliveryDirectoryDescriptor,
++    const nsAString& aLeafName, uint64_t& aAggregateBytes,
++    PendingPromisedFiles& aPendingFiles,
++    AutoTArray<nsCOMPtr<nsIFile>, 4>& aPromisedFiles) {
++  if (!DirectoryDescriptorMatchesPath(aSourceDirectoryDescriptor,
++                                      aSourceDirectory) ||
++      !DirectoryDescriptorMatchesPath(aDeliveryDirectoryDescriptor,
++                                      aDeliveryDirectory)) {
++    return NS_ERROR_FAILURE;
++  }
++
++  nsCOMPtr<nsIFile> sourceFile;
++  nsresult rv = aSourceDirectory->Clone(getter_AddRefs(sourceFile));
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++  rv = sourceFile->Append(aLeafName);
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++
++  nsAutoCString sourcePath;
++  if (NS_FAILED(sourceFile->GetNativePath(sourcePath))) {
++    return NS_ERROR_FAILURE;
++  }
++  int sourceDescriptor =
++      open(sourcePath.get(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
++  if (sourceDescriptor < 0) {
++    return NS_ERROR_FAILURE;
++  }
++  auto closeSource =
++      MakeScopeExit([sourceDescriptor]() { close(sourceDescriptor); });
++
++  struct stat sourceStatus;
++  if (fstat(sourceDescriptor, &sourceStatus) != 0 ||
++      !S_ISREG(sourceStatus.st_mode) || sourceStatus.st_uid != geteuid() ||
++      sourceStatus.st_nlink != 1 || sourceStatus.st_size < 0 ||
++      !FileDescriptorMatchesPath(sourceDescriptor, sourceFile, sourceStatus)) {
++    return NS_ERROR_FAILURE;
++  }
++  aPendingFiles.AddSource(sourceFile, sourceStatus);
++  if (sourceStatus.st_size > kMaximumPromisedFileBytes) {
++    return NS_ERROR_FAILURE;
++  }
++
++  uint64_t sourceBytes = static_cast<uint64_t>(sourceStatus.st_size);
++  if (sourceBytes > kMaximumPromisedFileAggregateBytes - aAggregateBytes) {
++    return NS_ERROR_FAILURE;
++  }
++
++  nsCOMPtr<nsIFile> deliveryFile;
++  rv = aDeliveryDirectory->Clone(getter_AddRefs(deliveryFile));
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++  rv = deliveryFile->Append(aLeafName);
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++
++  nsAutoCString deliveryPath;
++  if (NS_FAILED(deliveryFile->GetNativePath(deliveryPath))) {
++    return NS_ERROR_FAILURE;
++  }
++  int deliveryDescriptor =
++      open(deliveryPath.get(),
++           O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
++  if (deliveryDescriptor < 0) {
++    return NS_ERROR_FAILURE;
++  }
++  auto closeDelivery =
++      MakeScopeExit([deliveryDescriptor]() { close(deliveryDescriptor); });
++
++  struct stat deliveryStatus;
++  if (fstat(deliveryDescriptor, &deliveryStatus) != 0 ||
++      !S_ISREG(deliveryStatus.st_mode) || deliveryStatus.st_uid != geteuid() ||
++      deliveryStatus.st_nlink != 1 ||
++      !FileDescriptorMatchesPath(deliveryDescriptor, deliveryFile,
++                                 deliveryStatus)) {
++    return NS_ERROR_FAILURE;
++  }
++  aPendingFiles.AddDelivery(deliveryFile, deliveryStatus);
++  if (fchmod(deliveryDescriptor, 0600) != 0) {
++    return NS_ERROR_FAILURE;
++  }
++
++  auto sourceBuffer = MakeUnique<char[]>(kPromiseCopyBufferBytes);
++  auto deliveryBuffer = MakeUnique<char[]>(kPromiseCopyBufferBytes);
++  off_t offset = 0;
++  while (offset < sourceStatus.st_size) {
++    off_t remaining = sourceStatus.st_size - offset;
++    size_t length = remaining < static_cast<off_t>(kPromiseCopyBufferBytes)
++                        ? static_cast<size_t>(remaining)
++                        : kPromiseCopyBufferBytes;
++    if (!ReadExactlyAt(sourceDescriptor, sourceBuffer.get(), length, offset) ||
++        !WriteExactlyAt(deliveryDescriptor, sourceBuffer.get(), length,
++                        offset)) {
++      return NS_ERROR_FAILURE;
++    }
++    offset += static_cast<off_t>(length);
++  }
++
++  char extraByte;
++  if (ReadAt(sourceDescriptor, &extraByte, 1, sourceStatus.st_size) != 0) {
++    return NS_ERROR_FAILURE;
++  }
++
++  offset = 0;
++  while (offset < sourceStatus.st_size) {
++    off_t remaining = sourceStatus.st_size - offset;
++    size_t length = remaining < static_cast<off_t>(kPromiseCopyBufferBytes)
++                        ? static_cast<size_t>(remaining)
++                        : kPromiseCopyBufferBytes;
++    if (!ReadExactlyAt(sourceDescriptor, sourceBuffer.get(), length, offset) ||
++        !ReadExactlyAt(deliveryDescriptor, deliveryBuffer.get(), length,
++                       offset) ||
++        memcmp(sourceBuffer.get(), deliveryBuffer.get(), length) != 0) {
++      return NS_ERROR_FAILURE;
++    }
++    offset += static_cast<off_t>(length);
++  }
++
++  struct stat finalSourceStatus;
++  struct stat finalDeliveryStatus;
++  if (fstat(sourceDescriptor, &finalSourceStatus) != 0 ||
++      fstat(deliveryDescriptor, &finalDeliveryStatus) != 0 ||
++      !SameRegularFileState(sourceStatus, finalSourceStatus) ||
++      !S_ISREG(finalDeliveryStatus.st_mode) ||
++      finalDeliveryStatus.st_uid != geteuid() ||
++      finalDeliveryStatus.st_nlink != 1 ||
++      finalDeliveryStatus.st_size != sourceStatus.st_size ||
++      (finalDeliveryStatus.st_mode & 0777) != 0600 ||
++      !FileDescriptorMatchesPath(sourceDescriptor, sourceFile,
++                                 finalSourceStatus) ||
++      !FileDescriptorMatchesPath(deliveryDescriptor, deliveryFile,
++                                 finalDeliveryStatus) ||
++      !DirectoryDescriptorMatchesPath(aSourceDirectoryDescriptor,
++                                      aSourceDirectory) ||
++      !DirectoryDescriptorMatchesPath(aDeliveryDirectoryDescriptor,
++                                      aDeliveryDirectory)) {
++    return NS_ERROR_FAILURE;
++  }
++
++  int closeResult = close(deliveryDescriptor);
++  closeDelivery.release();
++  if (closeResult != 0) {
++    return NS_ERROR_FAILURE;
++  }
++
++  struct stat closedDeliveryStatus;
++  nsAutoCString closedDeliveryPath;
++  if (NS_FAILED(deliveryFile->GetNativePath(closedDeliveryPath)) ||
++      lstat(closedDeliveryPath.get(), &closedDeliveryStatus) != 0 ||
++      !SameRegularFileState(finalDeliveryStatus, closedDeliveryStatus)) {
++    return NS_ERROR_FAILURE;
++  }
++
++  aAggregateBytes += sourceBytes;
++  aPromisedFiles.AppendElement(deliveryFile);
++  return NS_OK;
++}
++
++nsresult SnapshotPromisedFiles(
++    nsIFile* aSourceDirectory, int aSourceDirectoryDescriptor,
++    nsIFile* aDeliveryDirectory, int aDeliveryDirectoryDescriptor,
++    const nsTArray<nsString>& aPromisedNames,
++    PendingPromisedFiles& aPendingFiles,
++    AutoTArray<nsCOMPtr<nsIFile>, 4>& aPromisedFiles) {
++  uint64_t aggregateBytes = 0;
++  for (const auto& name : aPromisedNames) {
++    nsresult rv = SnapshotPromisedFile(
++        aSourceDirectory, aSourceDirectoryDescriptor, aDeliveryDirectory,
++        aDeliveryDirectoryDescriptor, name, aggregateBytes, aPendingFiles,
++        aPromisedFiles);
++    if (NS_FAILED(rv)) {
++      return rv;
++    }
++  }
++
++  return aPromisedFiles.Length() == aPromisedNames.Length() ? NS_OK
++                                                            : NS_ERROR_FAILURE;
++}
++
++nsresult MaterializeModernFilePromises(
++    NSPasteboard* aPasteboard, NSURL* aDestinationURL,
++    NSString* aStandardDestinationPath, uint32_t aExpectedPromiseCount,
++    AutoTArray<nsString, 4>& aPromisedNames) {
++  NSString* pasteboardName = [aPasteboard name];
++  if (!pasteboardName) {
++    return NS_ERROR_FAILURE;
++  }
++
++  PasteboardRef carbonPasteboard = nullptr;
++  OSStatus status =
++      PasteboardCreate((CFStringRef)pasteboardName, &carbonPasteboard);
++  if (!carbonPasteboard) {
++    return NS_ERROR_FAILURE;
++  }
++
++  auto releasePasteboard =
++      MakeScopeExit([carbonPasteboard]() { CFRelease(carbonPasteboard); });
++  if (status != noErr) {
++    return NS_ERROR_FAILURE;
++  }
++
++  PasteboardSynchronize(carbonPasteboard);
++  ItemCount itemCount = 0;
++  status = PasteboardGetItemCount(carbonPasteboard, &itemCount);
++  if (status != noErr || !itemCount || itemCount != aExpectedPromiseCount ||
++      itemCount > kMaximumPromisedFileCount) {
++    return NS_ERROR_FAILURE;
++  }
++
++  AutoTArray<PasteboardItemID, 4> promisedItemIdentifiers;
++  for (ItemCount index = 1; index <= itemCount; ++index) {
++    PasteboardItemID itemIdentifier = nullptr;
++    if (PasteboardGetItemIdentifier(carbonPasteboard, index, &itemIdentifier) !=
++        noErr) {
++      return NS_ERROR_FAILURE;
++    }
++
++    PasteboardFlavorFlags flags = 0;
++    if (PasteboardGetItemFlavorFlags(carbonPasteboard, itemIdentifier,
++                                     kPasteboardTypeFileURLPromise,
++                                     &flags) != noErr) {
++      continue;
++    }
++
++    // Apple's receiver protocol asks for the promised content type before it
++    // supplies the paste location and requests the promised file URL.
++    CFDataRef contentTypeData = nullptr;
++    status = PasteboardCopyItemFlavorData(carbonPasteboard, itemIdentifier,
++                                          kPasteboardTypeFilePromiseContent,
++                                          &contentTypeData);
++    if (status != noErr || !contentTypeData) {
++      if (contentTypeData) {
++        CFRelease(contentTypeData);
++      }
++      return NS_ERROR_FAILURE;
++    }
++    auto releaseContentTypeData =
++        MakeScopeExit([contentTypeData]() { CFRelease(contentTypeData); });
++    if (CFDataGetLength(contentTypeData) <= 0 ||
++        CFDataGetLength(contentTypeData) > kMaximumPromiseMetadataBytes) {
++      return NS_ERROR_FAILURE;
++    }
++    promisedItemIdentifiers.AppendElement(itemIdentifier);
++  }
++
++  // Do not silently discard ordinary pasteboard items from a mixed drag. The
++  // materialized result must represent the complete native item set.
++  if (promisedItemIdentifiers.IsEmpty() ||
++      promisedItemIdentifiers.Length() != itemCount) {
++    return NS_ERROR_FAILURE;
++  }
++
++  status =
++      PasteboardSetPasteLocation(carbonPasteboard, (CFURLRef)aDestinationURL);
++  if (status != noErr) {
++    return NS_ERROR_FAILURE;
++  }
++
++  for (PasteboardItemID itemIdentifier : promisedItemIdentifiers) {
++    CFDataRef URLData = nullptr;
++    status =
++        PasteboardCopyItemFlavorData(carbonPasteboard, itemIdentifier,
++                                     kPasteboardTypeFileURLPromise, &URLData);
++    if (status != noErr || !URLData) {
++      if (URLData) {
++        CFRelease(URLData);
++      }
++      return NS_ERROR_FAILURE;
++    }
++    auto releaseURLData = MakeScopeExit([URLData]() { CFRelease(URLData); });
++
++    CFIndex length = CFDataGetLength(URLData);
++    const UInt8* bytes = CFDataGetBytePtr(URLData);
++    if (!bytes) {
++      return NS_ERROR_FAILURE;
++    }
++    while (length > 0 && bytes[length - 1] == 0) {
++      --length;
++    }
++    if (length <= 0 || length > kMaximumPromiseMetadataBytes ||
++        memchr(bytes, 0, static_cast<size_t>(length))) {
++      return NS_ERROR_FAILURE;
++    }
++
++    NSString* URLString =
++        [[[NSString alloc] initWithBytes:bytes
++                                  length:static_cast<NSUInteger>(length)
++                                encoding:NSUTF8StringEncoding] autorelease];
++    NSURL* fileURL = URLString ? [NSURL URLWithString:URLString] : nil;
++    nsresult rv = ValidatePromiseURLAndAppendName(
++        fileURL, aStandardDestinationPath, aPromisedNames);
++    if (NS_FAILED(rv)) {
++      return rv;
++    }
++  }
++
++  if (aPromisedNames.Length() != promisedItemIdentifiers.Length()) {
++    return NS_ERROR_FAILURE;
++  }
++  return NS_OK;
++}
++
++}  // namespace
++
+ // This global makes the transferable array available to Cocoa's promised
+ // file destination callback.
+ mozilla::StaticRefPtr<nsIArray> gDraggedTransferables;
+@@ -49,10 +1113,215 @@
+   return sess.forget();
+ }
+ 
++nsresult nsDragSession::MaterializePromisedFiles(
++    id<NSDraggingInfo> aDraggingInfo) {
++  NS_OBJC_BEGIN_TRY_BLOCK_RETURN;
++
++  MOZ_ASSERT(NS_IsMainThread());
++
++  if (!aDraggingInfo) {
++    return NS_ERROR_INVALID_ARG;
++  }
++
++  // Gecko-originated drags already have their complete transferable array.
++  // They may advertise the same URL-promise type for native destinations, but
++  // must not be converted into an external, system-principal DataTransfer.
++  if (mDataItems) {
++    return NS_OK;
++  }
++
++  if (!mPromisedFiles.IsEmpty()) {
++    return NS_OK;
++  }
++
++  NSPasteboard* pasteboard = [aDraggingInfo draggingPasteboard];
++  if (!PasteboardHasModernFilePromise(pasteboard)) {
++    return NS_OK;
++  }
++
++  uint32_t expectedPromiseCount = ModernFilePromiseCount(pasteboard);
++  if (!expectedPromiseCount) {
++    return NS_ERROR_FAILURE;
++  }
++
++  nsCOMPtr<nsIFile> temporaryDirectory;
++  nsresult rv = NS_GetSpecialDirectory(NS_OS_TEMP_DIR,
++                                       getter_AddRefs(temporaryDirectory));
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++
++  nsCOMPtr<nsIFile> inboxDirectory;
++  rv = CreatePrivateDirectory(temporaryDirectory, kPromiseInboxName, true,
++                              inboxDirectory);
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++
++  int inboxDescriptor = -1;
++  rv = OpenPrivateDirectory(inboxDirectory, &inboxDescriptor);
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++  auto closeInbox =
++      MakeScopeExit([inboxDescriptor]() { close(inboxDescriptor); });
++
++  nsCOMPtr<nsIFile> privateRoot;
++  rv = CreatePrivateDirectory(temporaryDirectory, kPrivatePromiseRootName, true,
++                              privateRoot);
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++
++  int privateRootDescriptor = -1;
++  rv = OpenPrivateDirectory(privateRoot, &privateRootDescriptor);
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++  auto closePrivateRoot = MakeScopeExit(
++      [privateRootDescriptor]() { close(privateRootDescriptor); });
++
++  nsCOMPtr<nsIFile> deliveryDirectory;
++  rv = CreatePrivateDirectory(privateRoot, kPromiseDeliveryDirectoryName, false,
++                              deliveryDirectory);
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++
++  int deliveryDescriptor = -1;
++  rv = OpenPrivateDirectory(deliveryDirectory, &deliveryDescriptor);
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++  auto closeDelivery =
++      MakeScopeExit([deliveryDescriptor]() { close(deliveryDescriptor); });
+ 
+-#if !defined(MAC_OS_X_VERSION_10_8) || MAC_OS_X_VERSION_MAX_ALLOWED < MAC_OS_X_VERSION_10_8
+-/* this imagewithSize, unlike the one in nsCocoaWindow.mm, 
+- * was added after 10.7 support was dropped. so, i am adding 
++  nsAutoString destinationPath;
++  rv = inboxDirectory->GetPath(destinationPath);
++  if (NS_FAILED(rv)) {
++    return rv;
++  }
++
++  NSURL* destinationURL =
++      [NSURL fileURLWithPath:nsCocoaUtils::ToNSString(destinationPath)
++                 isDirectory:YES];
++  if (!destinationURL) {
++    return NS_ERROR_FAILURE;
++  }
++
++  AutoTArray<nsString, 4> promisedNames;
++  NSString* standardDestinationPath =
++      [[destinationURL path] stringByStandardizingPath];
++  auto quarantineInboxOnException = MakeScopeExit([&]() {
++    nsCOMPtr<nsIFile> quarantinedDirectory;
++    Unused << RelocatePromiseDirectory(inboxDirectory, inboxDescriptor,
++                                       privateRoot, privateRootDescriptor,
++                                       quarantinedDirectory);
++    CleanupFailedPromiseDirectory(quarantinedDirectory
++                                      ? quarantinedDirectory.get()
++                                      : inboxDirectory.get(),
++                                  inboxDescriptor);
++  });
++  nsresult promiseResult = MaterializeModernFilePromises(
++      pasteboard, destinationURL, standardDestinationPath, expectedPromiseCount,
++      promisedNames);
++  quarantineInboxOnException.release();
++
++  // Quarantine the complete source-controlled namespace even if the source
++  // returned an incomplete promise set. Only an atomically relocated inbox is
++  // ever inspected, and web content receives only browser-created snapshots.
++  nsCOMPtr<nsIFile> sourceDirectory;
++  nsresult relocationResult =
++      RelocatePromiseDirectory(inboxDirectory, inboxDescriptor, privateRoot,
++                               privateRootDescriptor, sourceDirectory);
++  if (NS_FAILED(relocationResult)) {
++    CleanupFailedPromiseDirectory(
++        sourceDirectory ? sourceDirectory.get() : inboxDirectory.get(),
++        inboxDescriptor);
++    MOZ_LOG(sCocoaLog, LogLevel::Warning,
++            ("External file-promise inbox could not be quarantined"));
++    return relocationResult;
++  }
++  PendingPromisedFiles pendingFiles;
++  auto restoreSourcePermissions = MakeScopeExit(
++      [inboxDescriptor]() { Unused << fchmod(inboxDescriptor, 0700); });
++
++  rv = InventoryDirectPromiseFiles(sourceDirectory, inboxDescriptor,
++                                   pendingFiles);
++  if (NS_FAILED(rv)) {
++    MOZ_LOG(sCocoaLog, LogLevel::Warning,
++            ("External file-promise source inventory failed"));
++    return rv;
++  }
++
++  if (NS_FAILED(promiseResult) || promisedNames.IsEmpty()) {
++    MOZ_LOG(sCocoaLog, LogLevel::Warning,
++            ("External file promise did not materialize completely"));
++    return NS_FAILED(promiseResult) ? promiseResult : NS_ERROR_FAILURE;
++  }
++
++  AutoTArray<nsCOMPtr<nsIFile>, 4> promisedFiles;
++  rv = SnapshotPromisedFiles(sourceDirectory, inboxDescriptor,
++                             deliveryDirectory, deliveryDescriptor,
++                             promisedNames, pendingFiles, promisedFiles);
++  if (NS_FAILED(rv) || promisedFiles.IsEmpty()) {
++    MOZ_LOG(sCocoaLog, LogLevel::Warning,
++            ("External file promise snapshot failed"));
++    return NS_FAILED(rv) ? rv : NS_ERROR_FAILURE;
++  }
++
++  if (fchmod(inboxDescriptor, 0700) != 0) {
++    return NS_ERROR_FAILURE;
++  }
++  restoreSourcePermissions.release();
++
++  // The source directory was disclosed to the sender and is never exposed to
++  // web content. Remove every validated source leaf and the now-empty source
++  // directory before retaining only the browser-created delivery snapshots.
++  if (!pendingFiles.RemoveSourcesNow() ||
++      !RemoveTrackedPromisedFileDirectoryNow(sourceDirectory) ||
++      !pendingFiles.RetainDeliveriesUntilShutdown()) {
++    return NS_ERROR_FAILURE;
++  }
++
++  mPromisedFiles = std::move(promisedFiles);
++
++  // The DataTransfer created for dragenter cannot contain these files: AppKit
++  // only permits requesting the promise in performDragOperation:. Rebuild it
++  // now with the resolved item count. BrowserParent will serialize this fresh
++  // object before sending eDrop to a content process.
++  RefPtr<dom::DataTransfer> previousDataTransfer = GetDataTransfer();
++  uint32_t dropEffect = nsIDragService::DRAGDROP_ACTION_NONE;
++  nsAutoString effectAllowed;
++  nsAutoString mozCursor;
++  bool showFailAnimation = true;
++  if (previousDataTransfer) {
++    dropEffect = previousDataTransfer->DropEffectInt();
++    previousDataTransfer->GetEffectAllowed(effectAllowed);
++    previousDataTransfer->GetMozCursor(mozCursor);
++    showFailAnimation = previousDataTransfer->MozShowFailAnimation();
++  }
++
++  RefPtr<dom::DataTransfer> refreshedDataTransfer =
++      new dom::DataTransfer(nullptr, eDrop, true, Nothing());
++  refreshedDataTransfer->SetDropEffectInt(dropEffect);
++  if (!effectAllowed.IsEmpty()) {
++    refreshedDataTransfer->SetEffectAllowed(effectAllowed);
++  }
++  if (!mozCursor.IsEmpty()) {
++    refreshedDataTransfer->SetMozCursor(mozCursor);
++  }
++  refreshedDataTransfer->SetMozShowFailAnimation(showFailAnimation);
++  SetDataTransfer(refreshedDataTransfer);
++  return NS_OK;
++
++  NS_OBJC_END_TRY_BLOCK_RETURN(NS_ERROR_FAILURE);
++}
++
++#if !defined(MAC_OS_X_VERSION_10_8) || \
++    MAC_OS_X_VERSION_MAX_ALLOWED < MAC_OS_X_VERSION_10_8
++/* this imagewithSize, unlike the one in nsCocoaWindow.mm,
++ * was added after 10.7 support was dropped. so, i am adding
+  * it here because i saw an exception and it has to be here*/
+ @interface NSImage (ImageCreationWithDrawingHandler)
+ + (NSImage*)imageWithSize:(NSSize)size
+@@ -79,7 +1348,7 @@ + (NSImage*)imageWithSize:(NSSize)size
+         nsCocoaUtils::DevPixelsToCocoaPoints(dragRect.width, scaleFactor);
+     size.height =
+         nsCocoaUtils::DevPixelsToCocoaPoints(dragRect.height, scaleFactor);
+-    if(@available(macOS 10.8, *)) {
++    if (@available(macOS 10.8, *)) {
+       image = [NSImage imageWithSize:size
+                              flipped:YES
+                       drawingHandler:^BOOL(NSRect dstRect) {
+@@ -311,6 +1580,19 @@ + (NSImage*)imageWithSize:(NSSize)size
+     return NS_ERROR_FAILURE;
+   }
+ 
++  if (!mPromisedFiles.IsEmpty()) {
++    if (aItemIndex >= mPromisedFiles.Length()) {
++      return NS_ERROR_FAILURE;
++    }
++
++    for (const auto& flavor : flavors) {
++      if (flavor.EqualsLiteral(kFileMime)) {
++        return aTransferable->SetTransferData(kFileMime,
++                                              mPromisedFiles[aItemIndex]);
++      }
++    }
++  }
++
+   // if this drag originated within Mozilla we should just use the cached data
+   // from when the drag started if possible
+   if (mDataItems) {
+@@ -363,9 +1645,19 @@ + (NSImage*)imageWithSize:(NSSize)size
+ 
+   *_retval = false;
+ 
++  nsDependentCString dataFlavor(aDataFlavor);
++  if (dataFlavor.EqualsLiteral(kFileMime) && !mPromisedFiles.IsEmpty()) {
++    *_retval = true;
++    return NS_OK;
++  }
++
+   if (!globalDragPboard) return NS_ERROR_FAILURE;
+ 
+-  nsDependentCString dataFlavor(aDataFlavor);
++  if (!mDataItems && dataFlavor.EqualsLiteral(kFileMime) &&
++      FilePromiseCount(globalDragPboard)) {
++    *_retval = true;
++    return NS_OK;
++  }
+ 
+   // first see if we have data for this in our cached transferable
+   if (mDataItems) {
+@@ -427,12 +1719,23 @@ + (NSImage*)imageWithSize:(NSSize)size
+ 
+   *aNumItems = 0;
+ 
++  if (!mPromisedFiles.IsEmpty()) {
++    *aNumItems = static_cast<uint32_t>(mPromisedFiles.Length());
++    return NS_OK;
++  }
++
+   // first check to see if we have a number of items cached
+   if (mDataItems) {
+     mDataItems->GetLength(aNumItems);
+     return NS_OK;
+   }
+ 
++  uint32_t promiseCount = FilePromiseCount(globalDragPboard);
++  if (promiseCount) {
++    *aNumItems = promiseCount;
++    return NS_OK;
++  }
++
+   NSArray* droppedItems = [globalDragPboard pasteboardItems];
+   if (droppedItems) {
+     *aNumItems = [droppedItems count];
+@@ -443,6 +1746,10 @@ + (NSImage*)imageWithSize:(NSSize)size
+   NS_OBJC_END_TRY_BLOCK_RETURN(NS_ERROR_FAILURE);
+ }
+ 
++bool nsDragSession::MustUpdateDataTransfer(EventMessage aMessage) {
++  return aMessage == eDrop && !mPromisedFiles.IsEmpty();
++}
++
+ NS_IMETHODIMP
+ nsDragSession::UpdateDragImage(nsINode* aImage, int32_t aImageX,
+                                int32_t aImageY) {
+@@ -532,6 +1839,7 @@ + (NSImage*)imageWithSize:(NSSize)size
+ 
+   nsresult rv = nsBaseDragSession::EndDragSessionImpl(aDoneDrag, aKeyModifiers);
+   mDataItems = nullptr;
++  mPromisedFiles.Clear();
+   return rv;
+ 
+   NS_OBJC_END_TRY_BLOCK_RETURN(NS_ERROR_FAILURE);

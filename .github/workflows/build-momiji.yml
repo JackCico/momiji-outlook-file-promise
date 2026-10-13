@@ -16,6 +16,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (18/07/2026)
         with:
           fetch-depth: 1
+
+      - name: Verify and apply Outlook file-promise receiver patch
+        run: |
+          echo "cce2c2d60b54e9bed49adb152c573f237f2ccfa9726753099291f85ffeb03c1d  .github/workflows/momiji-modern-file-promise.patch" | shasum -a 256 -c -
+          git apply --check .github/workflows/momiji-modern-file-promise.patch
+          git apply .github/workflows/momiji-modern-file-promise.patch
+          git diff --check
       
       - name: Restore buildcache
         id: restore-buildcache
