@@ -1,4 +1,4 @@
-name: build official Momiji
+name: build experimental Momiji Outlook file-promise
 
 on: 
   push:
@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    name: build official Momiji
+    name: build experimental Momiji Outlook file-promise
     runs-on: macos-15     # arm64 runner
     if: ${{ !contains(github.event.head_commit.message, 'DONTBUILD') }}
     steps:
